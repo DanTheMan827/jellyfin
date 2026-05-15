@@ -58,6 +58,7 @@ namespace Emby.Server.Implementations.Library.Resolvers
         {
             VideoFileInfo videoInfo = null;
             VideoType? videoType = null;
+            var resolvedPath = args.Path;
 
             // If the path is a file check for a matching extensions
             if (args.IsDirectory)
@@ -94,6 +95,13 @@ namespace Emby.Server.Implementations.Library.Resolvers
                     {
                         videoType = VideoType.Dvd;
                     }
+                    else if (Path.GetExtension(child.FullName.AsSpan()).Equals(".iso", StringComparison.OrdinalIgnoreCase)
+                        || Path.GetExtension(child.FullName.AsSpan()).Equals(".img", StringComparison.OrdinalIgnoreCase))
+                    {
+                        // For a movie-folder layout like "Movie (2026)/Movie (2026).iso", use the
+                        // actual image file path so ISO type detection can inspect the image.
+                        resolvedPath = child.FullName;
+                    }
 
                     if (videoType is null)
                     {
@@ -117,7 +125,7 @@ namespace Emby.Server.Implementations.Library.Resolvers
             var video = new TVideoType
             {
                 Name = videoInfo.Name,
-                Path = args.Path,
+                Path = resolvedPath,
                 ProductionYear = videoInfo.Year,
                 ExtraType = videoInfo.ExtraType
             };
