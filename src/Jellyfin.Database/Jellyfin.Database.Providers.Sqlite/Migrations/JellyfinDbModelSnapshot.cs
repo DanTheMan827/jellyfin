@@ -249,6 +249,9 @@ namespace Jellyfin.Server.Implementations.Migrations
                     b.Property<bool>("IsVirtualItem")
                         .HasColumnType("INTEGER");
 
+                    b.Property<int?>("IsoPlaybackTitle")
+                        .HasColumnType("INTEGER");
+
                     b.Property<float?>("LUFS")
                         .HasColumnType("REAL");
 

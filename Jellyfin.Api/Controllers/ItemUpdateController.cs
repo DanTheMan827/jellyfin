@@ -189,6 +189,22 @@ public class ItemUpdateController : BaseJellyfinApiController
             SupportsLibBluray = _mediaEncoder.SupportsLibBluray
         };
 
+        if (item is Video video && IsIsoPlaybackTitleSupported(video))
+        {
+            IsoType? effectiveIsoType = video.VideoType switch
+            {
+                VideoType.Iso when video.IsoType.HasValue => video.IsoType.Value,
+                VideoType.BluRay => IsoType.BluRay,
+                VideoType.Dvd => IsoType.Dvd,
+                _ => null
+            };
+
+            if (effectiveIsoType is not null)
+            {
+                info.IsoTitleOptions = _mediaEncoder.GetIsoTitles(video.Path, effectiveIsoType.Value);
+            }
+        }
+
         if (!item.IsVirtualItem
             && item is not ICollectionFolder
             && item is not UserView
