@@ -32,6 +32,7 @@
     "HomeVideos": "Home Videos",
     "Inherit": "Inherit",
     "ItemAddedWithName": "{0} was added to the library",
+    "ItemNotDiscOrIso": "Item is not a DVD/Blu-ray ISO or unpacked disc.",
     "ItemRemovedWithName": "{0} was removed from the library",
     "LabelIpAddressValue": "IP address: {0}",
     "LabelRunningTimeValue": "Running time: {0}",
