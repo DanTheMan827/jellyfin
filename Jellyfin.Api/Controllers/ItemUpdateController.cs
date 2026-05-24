@@ -244,7 +244,7 @@ public class ItemUpdateController : BaseJellyfinApiController
 
         if (item is not Video video)
         {
-            return BadRequest(_localizationManager.GetLocalizedString("ItemNotDiscOrIso"));
+            return BadRequest(_localizationManager.GetLocalizedString("ItemNotDvdBluray"));
         }
 
         IsoType? effectiveIsoType = video.VideoType switch
@@ -278,7 +278,7 @@ public class ItemUpdateController : BaseJellyfinApiController
                 }
             }
 
-            return BadRequest(_localizationManager.GetLocalizedString("ItemNotDiscOrIso"));
+            return BadRequest(_localizationManager.GetLocalizedString("ItemNotDvdBluray"));
         }
 
         var titles = _mediaEncoder.GetIsoTitles(video.Path, effectiveIsoType.Value);
