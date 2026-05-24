@@ -2,7 +2,6 @@ using System.Collections.Generic;
 using Jellyfin.Data.Enums;
 using MediaBrowser.Model.Entities;
 using MediaBrowser.Model.Globalization;
-using MediaBrowser.Model.MediaInfo;
 using MediaBrowser.Model.Providers;
 
 namespace MediaBrowser.Model.Dto;
@@ -65,10 +64,4 @@ public class MetadataEditorInfo
     /// When <c>false</c>, Blu-ray title selection cannot be offered in the editor UI.
     /// </summary>
     public bool SupportsLibBluray { get; set; }
-
-    /// <summary>
-    /// Gets or sets the available ISO/disc playback title options for DVD or Blu-ray items.
-    /// When non-null, the UI should present a selection field for the playback title.
-    /// </summary>
-    public IReadOnlyList<IsoTitleInfo>? IsoTitleOptions { get; set; }
 }

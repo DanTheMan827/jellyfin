@@ -100,8 +100,6 @@ public class BaseItemEntity
 
     public Guid? PrimaryVersionId { get; set; }
 
-    public int? IsoPlaybackTitle { get; set; }
-
     public DateTime? DateLastMediaAdded { get; set; }
 
     public string? Album { get; set; }

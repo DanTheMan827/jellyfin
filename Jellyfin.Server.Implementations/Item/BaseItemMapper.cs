@@ -134,7 +134,6 @@ internal static class BaseItemMapper
         if (dto is Video video)
         {
             video.PrimaryVersionId = entity.PrimaryVersionId;
-            video.IsoPlaybackTitle = entity.IsoPlaybackTitle;
         }
 
         if (dto is IHasSeries hasSeriesName)
@@ -309,7 +308,6 @@ internal static class BaseItemMapper
         if (dto is Video video)
         {
             entity.PrimaryVersionId = video.PrimaryVersionId;
-            entity.IsoPlaybackTitle = video.IsoPlaybackTitle;
         }
 
         if (dto is IHasSeries hasSeriesName)
