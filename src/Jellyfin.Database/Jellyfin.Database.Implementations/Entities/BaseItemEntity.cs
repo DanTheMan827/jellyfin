@@ -54,6 +54,11 @@ public class BaseItemEntity
 
     public long? RunTimeTicks { get; set; }
 
+    /// <summary>
+    /// Gets or sets the start position within the source audio file (in ticks), used for CUE sheet tracks.
+    /// </summary>
+    public long? StartPositionTicks { get; set; }
+
     public DateTime? DateCreated { get; set; }
 
     public DateTime? DateModified { get; set; }

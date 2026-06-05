@@ -5,6 +5,7 @@ using System.Linq;
 using System.Threading;
 using System.Threading.Tasks;
 using ATL;
+using Emby.Naming.Audio;
 using Jellyfin.Data.Enums;
 using Jellyfin.Extensions;
 using MediaBrowser.Controller.Chapters;
@@ -92,6 +93,13 @@ namespace MediaBrowser.Providers.MediaInfo
             var path = item.Path;
             var protocol = item.PathProtocol ?? MediaProtocol.File;
 
+            // For CUE sheet track items the Path contains a virtual suffix (e.g. "album.flac::cue::01").
+            // Probe the actual physical file path so the encoder can open it.
+            // GetPhysicalPath is a no-op for regular items, so isCueTrack is true only when the path changed.
+            var physicalPath = CueSheetParser.GetPhysicalPath(path);
+            var isCueTrack = !string.Equals(physicalPath, path, StringComparison.Ordinal);
+            path = physicalPath;
+
             if (!item.IsShortcut || options.EnableRemoteContentProbe)
             {
                 if (item.IsShortcut)
@@ -115,7 +123,7 @@ namespace MediaBrowser.Providers.MediaInfo
 
                 cancellationToken.ThrowIfCancellationRequested();
 
-                await FetchAsync(item, result, options, cancellationToken).ConfigureAwait(false);
+                await FetchAsync(item, result, options, cancellationToken, isCueTrack).ConfigureAwait(false);
             }
 
             return ItemUpdateType.MetadataImport;
@@ -128,24 +136,34 @@ namespace MediaBrowser.Providers.MediaInfo
         /// <param name="mediaInfo">The <see cref="Model.MediaInfo.MediaInfo"/>.</param>
         /// <param name="options">The <see cref="MetadataRefreshOptions"/>.</param>
         /// <param name="cancellationToken">The <see cref="CancellationToken"/>.</param>
+        /// <param name="isCueTrack">When <c>true</c>, the item is a CUE sheet track; metadata and duration are preserved.</param>
         /// <returns>A <see cref="Task"/> representing the asynchronous operation.</returns>
         private async Task FetchAsync(
             Audio audio,
             Model.MediaInfo.MediaInfo mediaInfo,
             MetadataRefreshOptions options,
-            CancellationToken cancellationToken)
+            CancellationToken cancellationToken,
+            bool isCueTrack = false)
         {
             audio.Container = mediaInfo.Container;
             audio.TotalBitrate = mediaInfo.Bitrate;
 
-            audio.RunTimeTicks = mediaInfo.RunTimeTicks;
+            // For CUE sheet tracks, the run-time comes from the .cue file (already set on the item).
+            // Probing the source audio file would return the *total* file duration, not the track duration.
+            if (!isCueTrack)
+            {
+                audio.RunTimeTicks = mediaInfo.RunTimeTicks;
+            }
 
             // Add external lyrics first to prevent the lrc file get overwritten on first scan
             var mediaStreams = new List<MediaStream>(mediaInfo.MediaStreams);
             AddExternalLyrics(audio, mediaStreams, options);
             var tryExtractEmbeddedLyrics = mediaStreams.All(s => s.Type != MediaStreamType.Lyric);
 
-            if (!audio.IsLocked)
+            // For CUE sheet tracks, metadata (title, artist, etc.) is already populated from the .cue file.
+            // Fetching tags from the source audio file would overwrite the per-track metadata with
+            // album-level tags embedded in the file, so we skip that step.
+            if (!audio.IsLocked && !isCueTrack)
             {
                 await FetchDataFromTags(audio, mediaInfo, options, tryExtractEmbeddedLyrics).ConfigureAwait(false);
                 if (tryExtractEmbeddedLyrics)
@@ -174,7 +192,10 @@ namespace MediaBrowser.Providers.MediaInfo
         private async Task FetchDataFromTags(Audio audio, Model.MediaInfo.MediaInfo mediaInfo, MetadataRefreshOptions options, bool tryExtractEmbeddedLyrics)
         {
             var libraryOptions = _libraryManager.GetLibraryOptions(audio);
-            Track track = new Track(audio.Path);
+
+            // CUE sheet track items store a virtual path; use the physical file for tag reading.
+            var physicalPath = CueSheetParser.GetPhysicalPath(audio.Path);
+            Track track = new Track(physicalPath);
 
             if (track.MetadataFormats
                 .All(mf => string.Equals(mf.ShortName, "ID3v1", StringComparison.OrdinalIgnoreCase)))

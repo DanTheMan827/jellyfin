@@ -665,6 +665,13 @@ namespace MediaBrowser.Controller.Entities
         public long? RunTimeTicks { get; set; }
 
         /// <summary>
+        /// Gets or sets the start position within the source audio file (in ticks).
+        /// Used for CUE sheet tracks to indicate where in the source file this track begins.
+        /// </summary>
+        [JsonIgnore]
+        public long? StartPositionTicks { get; set; }
+
+        /// <summary>
         /// Gets or sets the production year.
         /// </summary>
         /// <value>The production year.</value>

@@ -8,6 +8,7 @@ using System.ComponentModel;
 using System.Globalization;
 using System.Linq;
 using System.Text.Json.Serialization;
+using Emby.Naming.Audio;
 using Jellyfin.Data.Enums;
 using MediaBrowser.Controller.Providers;
 using MediaBrowser.Model.Dto;
@@ -149,5 +150,33 @@ namespace MediaBrowser.Controller.Entities.Audio
 
         protected override IEnumerable<(BaseItem Item, MediaSourceType MediaSourceType)> GetAllItemsForMediaSources()
             => new[] { ((BaseItem)this, MediaSourceType.Default) };
+
+        /// <inheritdoc />
+        public override IReadOnlyList<MediaSourceInfo> GetMediaSources(bool enablePathSubstitution)
+        {
+            var sources = base.GetMediaSources(enablePathSubstitution);
+
+            // For CUE sheet tracks, fix up the media source so playback uses the physical file
+            // and includes the track's start offset within that file.
+            if (StartPositionTicks.HasValue && StartPositionTicks.Value > 0 && CueSheetParser.IsCuePath(Path))
+            {
+                foreach (var source in sources)
+                {
+                    // Strip the ::cue::NN suffix to get the actual audio file path
+                    if (!string.IsNullOrEmpty(source.Path))
+                    {
+                        source.Path = CueSheetParser.GetPhysicalPath(source.Path);
+                    }
+
+                    source.StartPositionTicks = StartPositionTicks;
+
+                    // CUE tracks must be transcoded — direct play/stream would ignore the start offset
+                    source.SupportsDirectPlay = false;
+                    source.SupportsDirectStream = false;
+                }
+            }
+
+            return sources;
+        }
     }
 }

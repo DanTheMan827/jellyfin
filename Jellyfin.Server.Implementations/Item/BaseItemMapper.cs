@@ -60,6 +60,7 @@ public static class BaseItemMapper
         dto.SortName = entity.SortName;
         dto.ForcedSortName = entity.ForcedSortName;
         dto.RunTimeTicks = entity.RunTimeTicks;
+        dto.StartPositionTicks = entity.StartPositionTicks;
         dto.PreferredMetadataLanguage = entity.PreferredMetadataLanguage;
         dto.PreferredMetadataCountryCode = entity.PreferredMetadataCountryCode;
         dto.IsInMixedFolder = entity.IsInMixedFolder;
@@ -236,6 +237,7 @@ public static class BaseItemMapper
         entity.SortName = dto.SortName;
         entity.ForcedSortName = dto.ForcedSortName;
         entity.RunTimeTicks = dto.RunTimeTicks;
+        entity.StartPositionTicks = dto.StartPositionTicks;
         entity.PreferredMetadataLanguage = dto.PreferredMetadataLanguage;
         entity.PreferredMetadataCountryCode = dto.PreferredMetadataCountryCode;
         entity.IsInMixedFolder = dto.IsInMixedFolder;
