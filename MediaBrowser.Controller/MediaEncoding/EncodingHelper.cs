@@ -86,6 +86,7 @@ namespace MediaBrowser.Controller.MediaEncoding
         private readonly Version _minFFmpegQsvVppScaleModeOption = new Version(6, 0);
         private readonly Version _minFFmpegRkmppHevcDecDoviRpu = new Version(7, 1, 1);
         private readonly Version _minFFmpegReadrateCatchupOption = new Version(8, 0);
+        private readonly Version _minFFmpegNoiseBsfDrop = new Version(5, 0);
 
         private static readonly string[] _videoProfilesH264 =
         [
@@ -1249,7 +1250,8 @@ namespace MediaBrowser.Controller.MediaEncoding
                 arg.Append(canvasArgs);
             }
 
-            if (state.MediaSource.VideoType == VideoType.Dvd || state.MediaSource.VideoType == VideoType.BluRay)
+            if ((state.MediaSource.VideoType == VideoType.Dvd && (!state.MediaSource.IsoPlaybackTitle.HasValue || !_mediaEncoder.SupportsDvdVideo))
+                || (state.MediaSource.VideoType == VideoType.BluRay && (!state.MediaSource.IsoPlaybackTitle.HasValue || !_mediaEncoder.SupportsLibBluray)))
             {
                 var concatFilePath = Path.Join(_configurationManager.CommonApplicationPaths.CachePath, "concat", state.MediaSource.Id + ".concat");
                 if (!File.Exists(concatFilePath))
@@ -1261,8 +1263,76 @@ namespace MediaBrowser.Controller.MediaEncoding
                     .Append(concatFilePath)
                     .Append("\" ");
             }
+            else if (state.MediaSource.VideoType == VideoType.Dvd
+                && state.MediaSource.IsoPlaybackTitle.HasValue
+                && _mediaEncoder.SupportsDvdVideo)
+            {
+                // Unpacked DVD directory with an explicit title selection: use dvdvideo demuxer.
+                // IsoPlaybackTitle is 1-based.
+                var titleNumber = state.MediaSource.IsoPlaybackTitle.Value;
+                arg.Append(" -f dvdvideo -title ")
+                    .Append(titleNumber)
+                    .Append(" -i ")
+                    .Append(_mediaEncoder.GetInputPathArgument(state));
+            }
+            else if (state.MediaSource.VideoType == VideoType.BluRay
+                && state.MediaSource.IsoPlaybackTitle.HasValue
+                && _mediaEncoder.SupportsLibBluray)
+            {
+                // Unpacked Blu-ray directory with an explicit title selection: use libbluray title selection.
+                // IsoPlaybackTitle is 1-based for display; libbluray expects the specific number of the .mpls file.
+                var titleNumber = state.MediaSource.IsoPlaybackTitle.Value;
+                arg.Append(" -playlist ")
+                    .Append(titleNumber.ToString(CultureInfo.InvariantCulture).PadLeft(5, '0'))
+                    .Append(" -i ")
+                    .Append(_mediaEncoder.GetInputPathArgument(state));
+            }
+            else if (state.MediaSource.VideoType == VideoType.Iso
+                && state.MediaSource.IsoType == IsoType.Dvd)
+            {
+                if (_mediaEncoder.SupportsDvdVideo)
+                {
+                    // DVD ISO: use the dvdvideo demuxer which requires libdvdnav + libdvdread.
+                    // Use the stored playback title; if none is set, resolve the longest title on demand.
+                    var titleNumber = state.MediaSource.IsoPlaybackTitle
+                        ?? GetLongestIsoTitleNumber(state.MediaPath, IsoType.Dvd, _mediaEncoder);
+                    arg.Append(" -f dvdvideo -title ")
+                        .Append(titleNumber)
+                        .Append(" -i ")
+                        .Append(_mediaEncoder.GetInputPathArgument(state));
+                }
+                else
+                {
+                    // dvdvideo demuxer unavailable: fall back to passing the ISO path directly.
+                    arg.Append(" -i ")
+                        .Append(_mediaEncoder.GetInputPathArgument(state));
+                }
+            }
+            else if (state.MediaSource.VideoType == VideoType.Iso
+                && state.MediaSource.IsoType == IsoType.BluRay)
+            {
+                if (_mediaEncoder.SupportsLibBluray)
+                {
+                    // Blu-ray ISO: pass -playlist N (BDMV/PLAYLIST/?????.mpls) before the input.
+                    // IsoPlaybackTitle is 1-based for display; libbluray expects the exact .mpls number.
+                    // If no title is stored, resolve the longest title on demand.
+                    var titleNumber = state.MediaSource.IsoPlaybackTitle
+                        ?? GetLongestIsoTitleNumber(state.MediaPath, IsoType.BluRay, _mediaEncoder);
+                    arg.Append(" -playlist ")
+                        .Append(titleNumber.ToString(CultureInfo.InvariantCulture).PadLeft(5, '0'))
+                        .Append(" -i ")
+                        .Append(_mediaEncoder.GetInputPathArgument(state));
+                }
+                else
+                {
+                    // libbluray unavailable: fall back to passing the ISO path directly.
+                    arg.Append(" -i ")
+                        .Append(_mediaEncoder.GetInputPathArgument(state));
+                }
+            }
             else
             {
+                // Covers generic ISOs (IsoType = null), plain video files, and anything not handled above.
                 arg.Append(" -i ")
                     .Append(_mediaEncoder.GetInputPathArgument(state));
             }
@@ -1547,20 +1617,61 @@ namespace MediaBrowser.Controller.MediaEncoding
 
         public string GetAudioBitStreamArguments(EncodingJobInfo state, string segmentContainer, string mediaSourceContainer)
         {
-            var bitStreamArgs = string.Empty;
+            var filters = new List<string>();
+
+            var noiseFilter = GetCopiedAudioTrimBsf(state);
+            if (!string.IsNullOrEmpty(noiseFilter))
+            {
+                filters.Add(noiseFilter);
+            }
+
             var segmentFormat = GetSegmentFileExtension(segmentContainer).TrimStart('.');
 
             // Apply aac_adtstoasc bitstream filter when media source is in mpegts.
             if (string.Equals(segmentFormat, "mp4", StringComparison.OrdinalIgnoreCase)
                 && (string.Equals(mediaSourceContainer, "ts", StringComparison.OrdinalIgnoreCase)
                     || string.Equals(mediaSourceContainer, "aac", StringComparison.OrdinalIgnoreCase)
-                    || string.Equals(mediaSourceContainer, "hls", StringComparison.OrdinalIgnoreCase)))
+                    || string.Equals(mediaSourceContainer, "hls", StringComparison.OrdinalIgnoreCase))
+                && IsAAC(state.AudioStream))
             {
-                bitStreamArgs = GetBitStreamArgs(state, MediaStreamType.Audio);
-                bitStreamArgs = string.IsNullOrEmpty(bitStreamArgs) ? string.Empty : " " + bitStreamArgs;
+                filters.Add("aac_adtstoasc");
             }
 
-            return bitStreamArgs;
+            return filters.Count == 0
+                ? string.Empty
+                : " -bsf:a " + string.Join(',', filters);
+        }
+
+        // When video is transcoded, accurate_seek (the default) trims video to the
+        // exact seek point via decoder-side frame discard. But stream-copied audio
+        // bypasses the decoder, so it starts from the nearest keyframe — potentially
+        // seconds before the target. Use the noise bsf to drop copied audio packets
+        // before the seek target, achieving the same trim precision without
+        // re-encoding. The noise bsf's drop= parameter requires ffmpeg >= 5.0.
+        // Important: make sure not to use it with wtv because it breaks seeking
+        private string GetCopiedAudioTrimBsf(EncodingJobInfo state)
+        {
+            if (state.TranscodingType is not TranscodingJobType.Hls
+                || !state.IsVideoRequest
+                || IsCopyCodec(state.OutputVideoCodec)
+                || !IsCopyCodec(state.OutputAudioCodec)
+                || string.Equals(state.InputContainer, "wtv", StringComparison.OrdinalIgnoreCase)
+                || _mediaEncoder.EncoderVersion < _minFFmpegNoiseBsfDrop)
+            {
+                return null;
+            }
+
+            var startTicks = state.BaseRequest.StartTimeTicks ?? 0;
+            if (startTicks <= 0)
+            {
+                return null;
+            }
+
+            var seekSeconds = startTicks / (double)TimeSpan.TicksPerSecond;
+            return string.Format(
+                CultureInfo.InvariantCulture,
+                "noise=drop='lt(pts*tb\\,{0:F3})'",
+                seekSeconds);
         }
 
         public static string GetSegmentFileExtension(string segmentContainer)
@@ -1763,13 +1874,13 @@ namespace MediaBrowser.Controller.MediaEncoding
             {
                 param += encoderPreset switch
                 {
-                        EncoderPreset.veryslow => " -preset p7",
-                        EncoderPreset.slower => " -preset p6",
-                        EncoderPreset.slow => " -preset p5",
-                        EncoderPreset.medium => " -preset p4",
-                        EncoderPreset.fast => " -preset p3",
-                        EncoderPreset.faster => " -preset p2",
-                        _ => " -preset p1"
+                    EncoderPreset.veryslow => " -preset p7",
+                    EncoderPreset.slower => " -preset p6",
+                    EncoderPreset.slow => " -preset p5",
+                    EncoderPreset.medium => " -preset p4",
+                    EncoderPreset.fast => " -preset p3",
+                    EncoderPreset.faster => " -preset p2",
+                    _ => " -preset p1"
                 };
             }
             else if (string.Equals(videoEncoder, "h264_amf", StringComparison.OrdinalIgnoreCase) // h264 (h264_amf)
@@ -1779,11 +1890,11 @@ namespace MediaBrowser.Controller.MediaEncoding
             {
                 param += encoderPreset switch
                 {
-                        EncoderPreset.veryslow => " -quality quality",
-                        EncoderPreset.slower => " -quality quality",
-                        EncoderPreset.slow => " -quality quality",
-                        EncoderPreset.medium => " -quality balanced",
-                        _ => " -quality speed"
+                    EncoderPreset.veryslow => " -quality quality",
+                    EncoderPreset.slower => " -quality quality",
+                    EncoderPreset.slow => " -quality quality",
+                    EncoderPreset.medium => " -quality balanced",
+                    _ => " -quality speed"
                 };
 
                 if (string.Equals(videoEncoder, "hevc_amf", StringComparison.OrdinalIgnoreCase)
@@ -1803,11 +1914,11 @@ namespace MediaBrowser.Controller.MediaEncoding
             {
                 param += encoderPreset switch
                 {
-                        EncoderPreset.veryslow => " -prio_speed 0",
-                        EncoderPreset.slower => " -prio_speed 0",
-                        EncoderPreset.slow => " -prio_speed 0",
-                        EncoderPreset.medium => " -prio_speed 0",
-                        _ => " -prio_speed 1"
+                    EncoderPreset.veryslow => " -prio_speed 0",
+                    EncoderPreset.slower => " -prio_speed 0",
+                    EncoderPreset.slow => " -prio_speed 0",
+                    EncoderPreset.medium => " -prio_speed 0",
+                    _ => " -prio_speed 1"
                 };
             }
 
@@ -2014,11 +2125,15 @@ namespace MediaBrowser.Controller.MediaEncoding
                 args += keyFrameArg + gopArg;
             }
 
-            // global_header produced by AMD HEVC VA-API encoder causes non-playable fMP4 on iOS
+            // The in-band Parameter Sets generated by the AMD HEVC VA-API encoder is inconsistent
+            // with the extradata generated by ffmpeg, causing decoding failures when using hvc1.
             if (string.Equals(codec, "hevc_vaapi", StringComparison.OrdinalIgnoreCase)
                 && _mediaEncoder.IsVaapiDeviceAmd)
             {
-                args += " -flags:v -global_header";
+                // Extracting the extradata from the in-band PS to bypass the issue.
+                // This can be removed once the issue is resolved in libva or Mesa.
+                // Transcoding is unavoidable here, so using BSF will not conflict with BSF in remuxing.
+                args += " -flags:v -global_header -bsf:v extract_extradata=remove=0";
             }
 
             return args;
@@ -2759,25 +2874,29 @@ namespace MediaBrowser.Controller.MediaEncoding
                 || string.Equals(audioCodec, "ac3", StringComparison.OrdinalIgnoreCase)
                 || string.Equals(audioCodec, "eac3", StringComparison.OrdinalIgnoreCase))
             {
+#pragma warning disable SA1008
                 return (inputChannels, outputChannels) switch
                 {
-                    (>= 6, >= 6 or 0) => Math.Min(640000, bitrate),
-                    (> 0, > 0) => Math.Min(outputChannels * 128000, bitrate),
-                    (> 0, _) => Math.Min(inputChannels * 128000, bitrate),
+                    ( >= 6, >= 6 or 0) => Math.Min(640000, bitrate),
+                    ( > 0, > 0) => Math.Min(outputChannels * 128000, bitrate),
+                    ( > 0, _) => Math.Min(inputChannels * 128000, bitrate),
                     (_, _) => Math.Min(384000, bitrate)
                 };
+#pragma warning restore SA1008
             }
 
             if (string.Equals(audioCodec, "dts", StringComparison.OrdinalIgnoreCase)
                 || string.Equals(audioCodec, "dca", StringComparison.OrdinalIgnoreCase))
             {
+#pragma warning disable SA1008
                 return (inputChannels, outputChannels) switch
                 {
-                    (>= 6, >= 6 or 0) => Math.Min(768000, bitrate),
-                    (> 0, > 0) => Math.Min(outputChannels * 136000, bitrate),
-                    (> 0, _) => Math.Min(inputChannels * 136000, bitrate),
+                    ( >= 6, >= 6 or 0) => Math.Min(768000, bitrate),
+                    ( > 0, > 0) => Math.Min(outputChannels * 136000, bitrate),
+                    ( > 0, _) => Math.Min(inputChannels * 136000, bitrate),
                     (_, _) => Math.Min(672000, bitrate)
                 };
+#pragma warning restore SA1008
             }
 
             // Empty bitrate area is not allow on iOS
@@ -2998,23 +3117,6 @@ namespace MediaBrowser.Controller.MediaEncoding
                 }
 
                 seekParam += string.Format(CultureInfo.InvariantCulture, "-ss {0}", _mediaEncoder.GetTimeParameter(seekTick));
-
-                if (state.IsVideoRequest)
-                {
-                    // If we are remuxing, then the copied stream cannot be seeked accurately (it will seek to the nearest
-                    // keyframe). If we are using fMP4, then force all other streams to use the same inaccurate seeking to
-                    // avoid A/V sync issues which cause playback issues on some devices.
-                    // When remuxing video, the segment start times correspond to key frames in the source stream, so this
-                    // option shouldn't change the seeked point that much.
-                    // Important: make sure not to use it with wtv because it breaks seeking
-                    if (state.TranscodingType is TranscodingJobType.Hls
-                        && string.Equals(segmentContainer, "mp4", StringComparison.OrdinalIgnoreCase)
-                        && (IsCopyCodec(state.OutputVideoCodec) || IsCopyCodec(state.OutputAudioCodec))
-                        && !string.Equals(state.InputContainer, "wtv", StringComparison.OrdinalIgnoreCase))
-                    {
-                        seekParam += " -noaccurate_seek";
-                    }
-                }
             }
 
             return seekParam;
@@ -3027,6 +3129,8 @@ namespace MediaBrowser.Controller.MediaEncoding
         /// <returns>System.String.</returns>
         public string GetMapArgs(EncodingJobInfo state)
         {
+            var mapAll = state.MapAll.HasValue && state.MapAll.Value;
+
             // If we don't have known media info
             // If input is video, use -sn to drop subtitles
             // Otherwise just return empty
@@ -3064,7 +3168,7 @@ namespace MediaBrowser.Controller.MediaEncoding
                 args += "-vn";
             }
 
-            if (state.AudioStream is not null)
+            if (!mapAll && state.AudioStream is not null)
             {
                 int audioStreamIndex = FindIndex(state.MediaSource.MediaStreams, state.AudioStream);
                 if (state.AudioStream.IsExternal)
@@ -3085,6 +3189,10 @@ namespace MediaBrowser.Controller.MediaEncoding
                         " -map 0:{0}",
                         audioStreamIndex);
                 }
+            }
+            else if (mapAll)
+            {
+                args += " -map 0:a";
             }
             else
             {
@@ -7744,6 +7852,11 @@ namespace MediaBrowser.Controller.MediaEncoding
             // Get the output codec name
             var codec = GetAudioEncoder(state);
 
+            if (state.MapAll.HasValue && state.MapAll.Value)
+            {
+                return "-codec:a " + codec;
+            }
+
             var args = "-codec:a:0 " + codec;
 
             if (IsCopyCodec(codec))
@@ -7874,6 +7987,12 @@ namespace MediaBrowser.Controller.MediaEncoding
             for (var i = 0; i < length; i++)
             {
                 var currentMediaStream = mediaStreams[i];
+
+                if (currentMediaStream.Codec == "dvd_nav_packet")
+                {
+                    continue;
+                }
+
                 if (currentMediaStream == streamToFind)
                 {
                     return index;
@@ -7933,6 +8052,37 @@ namespace MediaBrowser.Controller.MediaEncoding
 
             // -vsync is deprecated in FFmpeg 5.1 and will be removed in the future.
             return $" -vsync {videoSync}";
+        }
+
+        /// <summary>
+        /// Resolves the 1-based title number of the longest title in a DVD or Blu-ray ISO.
+        /// Used as a fallback at encode time when <see cref="MediaSourceInfo.IsoPlaybackTitle"/> is not set.
+        /// Falls back to title 1 if the title list is empty or enumeration fails.
+        /// </summary>
+        /// <param name="path">The path to the media.</param>
+        /// <param name="isoType">The type of iso if applicable.</param>
+        /// <param name="mediaEncoder">The media encoder instance.</param>
+        /// <returns>The number for the longest title.</returns>
+        public static int GetLongestIsoTitleNumber(string path, IsoType isoType, IMediaEncoder mediaEncoder)
+        {
+            try
+            {
+                var titles = mediaEncoder.GetIsoTitles(path, isoType);
+                if (titles.Count == 0)
+                {
+                    return 1;
+                }
+
+                return titles
+                    .OrderByDescending(t => t.DurationTicks ?? 0)
+                    .ThenByDescending(t => t.TitleNumber)
+                    .First()
+                    .TitleNumber;
+            }
+            catch
+            {
+                return 1;
+            }
         }
     }
 }

@@ -10,6 +10,7 @@ using System.Text.Json.Serialization;
 using System.Threading;
 using System.Threading.Tasks;
 using Jellyfin.Data.Enums;
+using Jellyfin.Database.Implementations.Entities;
 using Jellyfin.Extensions;
 using MediaBrowser.Controller.Library;
 using MediaBrowser.Controller.LiveTv;
@@ -132,6 +133,13 @@ namespace MediaBrowser.Controller.Entities
         /// </summary>
         /// <value>The type of the iso.</value>
         public IsoType? IsoType { get; set; }
+
+        /// <summary>
+        /// Gets or sets the 1-based playback title number to use when playing a DVD/Blu-ray ISO or directory.
+        /// When null, the default (longest) title is used.
+        /// </summary>
+        /// <value>The playback title number, or null for the default title.</value>
+        public int? IsoPlaybackTitle { get; set; }
 
         /// <summary>
         /// Gets or sets the video3 D format.
@@ -278,6 +286,17 @@ namespace MediaBrowser.Controller.Entities
             return linkedVersionCount + localVersionCount + 1;
         }
 
+        /// <inheritdoc />
+        public override string GetInheritedOriginalLanguage()
+        {
+            if (ExtraType.GetValueOrDefault() == Model.Entities.ExtraType.Trailer)
+            {
+                return GetOwner()?.GetInheritedOriginalLanguage();
+            }
+
+            return OriginalLanguage ?? GetOwner()?.GetInheritedOriginalLanguage();
+        }
+
         public override List<string> GetUserDataKeys()
         {
             var list = base.GetUserDataKeys();
@@ -379,13 +398,13 @@ namespace MediaBrowser.Controller.Entities
         /// <summary>
         /// Gets the additional parts.
         /// </summary>
+        /// <param name="user">The user to apply parental restrictions for, or <c>null</c> to skip restriction checks.</param>
         /// <returns>IEnumerable{Video}.</returns>
-        public IOrderedEnumerable<Video> GetAdditionalParts()
+        public IOrderedEnumerable<Video> GetAdditionalParts(User user = null)
         {
             return GetAdditionalPartIds()
-                .Select(i => LibraryManager.GetItemById(i))
+                .Select(i => LibraryManager.GetItemById<Video>(i, user))
                 .Where(i => i is not null)
-                .OfType<Video>()
                 .OrderBy(i => i.SortName);
         }
 

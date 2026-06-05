@@ -1987,7 +1987,8 @@ namespace Emby.Server.Implementations.Library
                 query.TopParentIds.Length == 0 &&
                 string.IsNullOrEmpty(query.AncestorWithPresentationUniqueKey) &&
                 string.IsNullOrEmpty(query.SeriesPresentationUniqueKey) &&
-                query.ItemIds.Length == 0)
+                query.ItemIds.Length == 0 &&
+                query.OwnerIds.Length == 0)
             {
                 var userViews = UserViewManager.GetUserViews(new UserViewQuery
                 {
@@ -3392,6 +3393,12 @@ namespace Emby.Server.Implementations.Library
         public IReadOnlyList<string> GetPeopleNames(InternalPeopleQuery query)
         {
             return _peopleRepository.GetPeopleNames(query);
+        }
+
+        /// <inheritdoc/>
+        public IReadOnlyDictionary<Guid, IReadOnlyList<string>> GetPeopleNamesByItems(IReadOnlyList<Guid> itemIds, IReadOnlyList<string> personTypes)
+        {
+            return _peopleRepository.GetPeopleNamesByItems(itemIds, personTypes);
         }
 
         public void UpdatePeople(BaseItem item, List<PersonInfo> people)

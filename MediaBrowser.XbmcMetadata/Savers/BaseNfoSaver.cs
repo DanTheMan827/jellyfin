@@ -97,7 +97,9 @@ namespace MediaBrowser.XbmcMetadata.Savers
             "isuserfavorite",
             "userrating",
 
-            "countrycode"
+            "countrycode",
+
+            "isoplaybacktitle",
         };
 
         protected BaseNfoSaver(
@@ -198,14 +200,22 @@ namespace MediaBrowser.XbmcMetadata.Savers
 
                 cancellationToken.ThrowIfCancellationRequested();
 
-                await SaveToFileAsync(memoryStream, path).ConfigureAwait(false);
+                await SaveToFileAsync(memoryStream, path, cancellationToken).ConfigureAwait(false);
             }
         }
 
-        private async Task SaveToFileAsync(Stream stream, string path)
+        private async Task SaveToFileAsync(Stream stream, string path, CancellationToken cancellationToken)
         {
             var directory = Path.GetDirectoryName(path) ?? throw new ArgumentException($"Provided path ({path}) is not valid.", nameof(path));
             Directory.CreateDirectory(directory);
+
+            // Compare byte-for-byte before proceeding.
+            if (File.Exists(path) && await stream.IsFileIdenticalAsync(path, cancellationToken).ConfigureAwait(false))
+            {
+                return; // Don't save since .nfo is unchanged.
+            }
+
+            stream.Position = 0;
 
             // On Windows, saving the file will fail if the file is hidden or readonly
             FileSystem.SetAttributes(path, false, false);
@@ -222,7 +232,7 @@ namespace MediaBrowser.XbmcMetadata.Savers
             var filestream = new FileStream(path, fileStreamOptions);
             await using (filestream.ConfigureAwait(false))
             {
-                await stream.CopyToAsync(filestream).ConfigureAwait(false);
+                await stream.CopyToAsync(filestream, cancellationToken).ConfigureAwait(false);
             }
 
             if (ConfigurationManager.Configuration.SaveMetadataHidden)
@@ -421,6 +431,17 @@ namespace MediaBrowser.XbmcMetadata.Savers
                                     writer.WriteElementString("format3d", "MVC");
                                     break;
                             }
+                        }
+
+                        // Persist the selected disc playback title so it survives a library re-scan.
+                        // For ISO items only write when IsoType is known; Dvd and BluRay directories always qualify.
+                        if (video.IsoPlaybackTitle.HasValue
+                            && (video.VideoType is VideoType.Dvd or VideoType.BluRay
+                                || (video.VideoType == VideoType.Iso && video.IsoType.HasValue)))
+                        {
+                            writer.WriteElementString(
+                                "isoplaybacktitle",
+                                video.IsoPlaybackTitle.Value.ToString(CultureInfo.InvariantCulture));
                         }
                     }
                 }
