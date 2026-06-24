@@ -15,7 +15,7 @@ namespace Jellyfin.Server.Implementations.Migrations
         protected override void BuildModel(ModelBuilder modelBuilder)
         {
 #pragma warning disable 612, 618
-            modelBuilder.HasAnnotation("ProductVersion", "10.0.7");
+            modelBuilder.HasAnnotation("ProductVersion", "10.0.8");
 
             modelBuilder.Entity("Jellyfin.Database.Implementations.Entities.AccessSchedule", b =>
                 {
@@ -335,6 +335,9 @@ namespace Jellyfin.Server.Implementations.Migrations
 
                     b.Property<DateTime?>("StartDate")
                         .HasColumnType("TEXT");
+
+                    b.Property<long?>("StartPositionTicks")
+                        .HasColumnType("INTEGER");
 
                     b.Property<string>("Studios")
                         .HasColumnType("TEXT");
@@ -1348,6 +1351,11 @@ namespace Jellyfin.Server.Implementations.Migrations
                     b.Property<bool>("MustUpdatePassword")
                         .HasColumnType("INTEGER");
 
+                    b.Property<string>("NormalizedUsername")
+                        .IsRequired()
+                        .HasMaxLength(255)
+                        .HasColumnType("TEXT");
+
                     b.Property<string>("Password")
                         .HasMaxLength(65535)
                         .HasColumnType("TEXT");
@@ -1389,6 +1397,9 @@ namespace Jellyfin.Server.Implementations.Migrations
                         .HasColumnType("TEXT");
 
                     b.HasKey("Id");
+
+                    b.HasIndex("NormalizedUsername")
+                        .IsUnique();
 
                     b.HasIndex("Username")
                         .IsUnique();

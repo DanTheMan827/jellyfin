@@ -86,6 +86,7 @@ namespace MediaBrowser.Controller.MediaEncoding
         private readonly Version _minFFmpegQsvVppScaleModeOption = new Version(6, 0);
         private readonly Version _minFFmpegRkmppHevcDecDoviRpu = new Version(7, 1, 1);
         private readonly Version _minFFmpegReadrateCatchupOption = new Version(8, 0);
+        private readonly Version _minFFmpegNoiseBsfDrop = new Version(5, 0);
 
         private static readonly string[] _videoProfilesH264 =
         [
@@ -1547,20 +1548,61 @@ namespace MediaBrowser.Controller.MediaEncoding
 
         public string GetAudioBitStreamArguments(EncodingJobInfo state, string segmentContainer, string mediaSourceContainer)
         {
-            var bitStreamArgs = string.Empty;
+            var filters = new List<string>();
+
+            var noiseFilter = GetCopiedAudioTrimBsf(state);
+            if (!string.IsNullOrEmpty(noiseFilter))
+            {
+                filters.Add(noiseFilter);
+            }
+
             var segmentFormat = GetSegmentFileExtension(segmentContainer).TrimStart('.');
 
             // Apply aac_adtstoasc bitstream filter when media source is in mpegts.
             if (string.Equals(segmentFormat, "mp4", StringComparison.OrdinalIgnoreCase)
                 && (string.Equals(mediaSourceContainer, "ts", StringComparison.OrdinalIgnoreCase)
                     || string.Equals(mediaSourceContainer, "aac", StringComparison.OrdinalIgnoreCase)
-                    || string.Equals(mediaSourceContainer, "hls", StringComparison.OrdinalIgnoreCase)))
+                    || string.Equals(mediaSourceContainer, "hls", StringComparison.OrdinalIgnoreCase))
+                && IsAAC(state.AudioStream))
             {
-                bitStreamArgs = GetBitStreamArgs(state, MediaStreamType.Audio);
-                bitStreamArgs = string.IsNullOrEmpty(bitStreamArgs) ? string.Empty : " " + bitStreamArgs;
+                filters.Add("aac_adtstoasc");
             }
 
-            return bitStreamArgs;
+            return filters.Count == 0
+                ? string.Empty
+                : " -bsf:a " + string.Join(',', filters);
+        }
+
+        // When video is transcoded, accurate_seek (the default) trims video to the
+        // exact seek point via decoder-side frame discard. But stream-copied audio
+        // bypasses the decoder, so it starts from the nearest keyframe — potentially
+        // seconds before the target. Use the noise bsf to drop copied audio packets
+        // before the seek target, achieving the same trim precision without
+        // re-encoding. The noise bsf's drop= parameter requires ffmpeg >= 5.0.
+        // Important: make sure not to use it with wtv because it breaks seeking
+        private string GetCopiedAudioTrimBsf(EncodingJobInfo state)
+        {
+            if (state.TranscodingType is not TranscodingJobType.Hls
+                || !state.IsVideoRequest
+                || IsCopyCodec(state.OutputVideoCodec)
+                || !IsCopyCodec(state.OutputAudioCodec)
+                || string.Equals(state.InputContainer, "wtv", StringComparison.OrdinalIgnoreCase)
+                || _mediaEncoder.EncoderVersion < _minFFmpegNoiseBsfDrop)
+            {
+                return null;
+            }
+
+            var startTicks = state.BaseRequest.StartTimeTicks ?? 0;
+            if (startTicks <= 0)
+            {
+                return null;
+            }
+
+            var seekSeconds = startTicks / (double)TimeSpan.TicksPerSecond;
+            return string.Format(
+                CultureInfo.InvariantCulture,
+                "noise=drop='lt(pts*tb\\,{0:F3})'",
+                seekSeconds);
         }
 
         public static string GetSegmentFileExtension(string segmentContainer)
@@ -1763,13 +1805,13 @@ namespace MediaBrowser.Controller.MediaEncoding
             {
                 param += encoderPreset switch
                 {
-                        EncoderPreset.veryslow => " -preset p7",
-                        EncoderPreset.slower => " -preset p6",
-                        EncoderPreset.slow => " -preset p5",
-                        EncoderPreset.medium => " -preset p4",
-                        EncoderPreset.fast => " -preset p3",
-                        EncoderPreset.faster => " -preset p2",
-                        _ => " -preset p1"
+                    EncoderPreset.veryslow => " -preset p7",
+                    EncoderPreset.slower => " -preset p6",
+                    EncoderPreset.slow => " -preset p5",
+                    EncoderPreset.medium => " -preset p4",
+                    EncoderPreset.fast => " -preset p3",
+                    EncoderPreset.faster => " -preset p2",
+                    _ => " -preset p1"
                 };
             }
             else if (string.Equals(videoEncoder, "h264_amf", StringComparison.OrdinalIgnoreCase) // h264 (h264_amf)
@@ -1779,11 +1821,11 @@ namespace MediaBrowser.Controller.MediaEncoding
             {
                 param += encoderPreset switch
                 {
-                        EncoderPreset.veryslow => " -quality quality",
-                        EncoderPreset.slower => " -quality quality",
-                        EncoderPreset.slow => " -quality quality",
-                        EncoderPreset.medium => " -quality balanced",
-                        _ => " -quality speed"
+                    EncoderPreset.veryslow => " -quality quality",
+                    EncoderPreset.slower => " -quality quality",
+                    EncoderPreset.slow => " -quality quality",
+                    EncoderPreset.medium => " -quality balanced",
+                    _ => " -quality speed"
                 };
 
                 if (string.Equals(videoEncoder, "hevc_amf", StringComparison.OrdinalIgnoreCase)
@@ -1803,11 +1845,11 @@ namespace MediaBrowser.Controller.MediaEncoding
             {
                 param += encoderPreset switch
                 {
-                        EncoderPreset.veryslow => " -prio_speed 0",
-                        EncoderPreset.slower => " -prio_speed 0",
-                        EncoderPreset.slow => " -prio_speed 0",
-                        EncoderPreset.medium => " -prio_speed 0",
-                        _ => " -prio_speed 1"
+                    EncoderPreset.veryslow => " -prio_speed 0",
+                    EncoderPreset.slower => " -prio_speed 0",
+                    EncoderPreset.slow => " -prio_speed 0",
+                    EncoderPreset.medium => " -prio_speed 0",
+                    _ => " -prio_speed 1"
                 };
             }
 
@@ -2014,11 +2056,15 @@ namespace MediaBrowser.Controller.MediaEncoding
                 args += keyFrameArg + gopArg;
             }
 
-            // global_header produced by AMD HEVC VA-API encoder causes non-playable fMP4 on iOS
+            // The in-band Parameter Sets generated by the AMD HEVC VA-API encoder is inconsistent
+            // with the extradata generated by ffmpeg, causing decoding failures when using hvc1.
             if (string.Equals(codec, "hevc_vaapi", StringComparison.OrdinalIgnoreCase)
                 && _mediaEncoder.IsVaapiDeviceAmd)
             {
-                args += " -flags:v -global_header";
+                // Extracting the extradata from the in-band PS to bypass the issue.
+                // This can be removed once the issue is resolved in libva or Mesa.
+                // Transcoding is unavoidable here, so using BSF will not conflict with BSF in remuxing.
+                args += " -flags:v -global_header -bsf:v extract_extradata=remove=0";
             }
 
             return args;
@@ -2759,25 +2805,29 @@ namespace MediaBrowser.Controller.MediaEncoding
                 || string.Equals(audioCodec, "ac3", StringComparison.OrdinalIgnoreCase)
                 || string.Equals(audioCodec, "eac3", StringComparison.OrdinalIgnoreCase))
             {
+#pragma warning disable SA1008
                 return (inputChannels, outputChannels) switch
                 {
-                    (>= 6, >= 6 or 0) => Math.Min(640000, bitrate),
-                    (> 0, > 0) => Math.Min(outputChannels * 128000, bitrate),
-                    (> 0, _) => Math.Min(inputChannels * 128000, bitrate),
+                    ( >= 6, >= 6 or 0) => Math.Min(640000, bitrate),
+                    ( > 0, > 0) => Math.Min(outputChannels * 128000, bitrate),
+                    ( > 0, _) => Math.Min(inputChannels * 128000, bitrate),
                     (_, _) => Math.Min(384000, bitrate)
                 };
+#pragma warning restore SA1008
             }
 
             if (string.Equals(audioCodec, "dts", StringComparison.OrdinalIgnoreCase)
                 || string.Equals(audioCodec, "dca", StringComparison.OrdinalIgnoreCase))
             {
+#pragma warning disable SA1008
                 return (inputChannels, outputChannels) switch
                 {
-                    (>= 6, >= 6 or 0) => Math.Min(768000, bitrate),
-                    (> 0, > 0) => Math.Min(outputChannels * 136000, bitrate),
-                    (> 0, _) => Math.Min(inputChannels * 136000, bitrate),
+                    ( >= 6, >= 6 or 0) => Math.Min(768000, bitrate),
+                    ( > 0, > 0) => Math.Min(outputChannels * 136000, bitrate),
+                    ( > 0, _) => Math.Min(inputChannels * 136000, bitrate),
                     (_, _) => Math.Min(672000, bitrate)
                 };
+#pragma warning restore SA1008
             }
 
             // Empty bitrate area is not allow on iOS
@@ -2978,6 +3028,13 @@ namespace MediaBrowser.Controller.MediaEncoding
         public string GetFastSeekCommandLineParameter(EncodingJobInfo state, EncodingOptions options, string segmentContainer)
         {
             var time = state.BaseRequest.StartTimeTicks ?? 0;
+
+            // For CUE sheet tracks, add the track's fixed start offset within the source file.
+            // The MediaSource.StartPositionTicks indicates where the track begins; the user's
+            // StartTimeTicks is a seek position within the track.
+            var cueStartTicks = state.MediaSource?.StartPositionTicks ?? 0;
+            time += cueStartTicks;
+
             var maxTime = state.RunTimeTicks ?? 0;
             var seekParam = string.Empty;
 
@@ -2998,23 +3055,6 @@ namespace MediaBrowser.Controller.MediaEncoding
                 }
 
                 seekParam += string.Format(CultureInfo.InvariantCulture, "-ss {0}", _mediaEncoder.GetTimeParameter(seekTick));
-
-                if (state.IsVideoRequest)
-                {
-                    // If we are remuxing, then the copied stream cannot be seeked accurately (it will seek to the nearest
-                    // keyframe). If we are using fMP4, then force all other streams to use the same inaccurate seeking to
-                    // avoid A/V sync issues which cause playback issues on some devices.
-                    // When remuxing video, the segment start times correspond to key frames in the source stream, so this
-                    // option shouldn't change the seeked point that much.
-                    // Important: make sure not to use it with wtv because it breaks seeking
-                    if (state.TranscodingType is TranscodingJobType.Hls
-                        && string.Equals(segmentContainer, "mp4", StringComparison.OrdinalIgnoreCase)
-                        && (IsCopyCodec(state.OutputVideoCodec) || IsCopyCodec(state.OutputAudioCodec))
-                        && !string.Equals(state.InputContainer, "wtv", StringComparison.OrdinalIgnoreCase))
-                    {
-                        seekParam += " -noaccurate_seek";
-                    }
-                }
             }
 
             return seekParam;
@@ -7852,9 +7892,11 @@ namespace MediaBrowser.Controller.MediaEncoding
 
             var inputModifier = GetInputModifier(state, encodingOptions, null);
 
+            var durationParam = GetCueDurationCommandLineParameter(state);
+
             return string.Format(
                 CultureInfo.InvariantCulture,
-                "{0} {1}{7}{8} -threads {2}{3} {4} -id3v2_version 3 -write_id3v1 1{6} -y \"{5}\"",
+                "{0} {1}{7}{8} -threads {2}{3} {4} -id3v2_version 3 -write_id3v1 1{6}{9} -y \"{5}\"",
                 inputModifier,
                 GetInputArgument(state, encodingOptions, null),
                 threads,
@@ -7863,7 +7905,94 @@ namespace MediaBrowser.Controller.MediaEncoding
                 outputPath,
                 string.Empty,
                 string.Empty,
-                string.Empty).Trim();
+                string.Empty,
+                string.IsNullOrEmpty(durationParam) ? string.Empty : " " + durationParam).Trim();
+        }
+
+        /// <summary>
+        /// Returns the ffmpeg <c>-t</c> duration parameter for CUE sheet tracks so that encoding
+        /// stops at the end of the track boundary within the source audio file.
+        /// Returns an empty string for non-CUE tracks.
+        /// </summary>
+        /// <param name="state">The current encoding job info.</param>
+        /// <returns>A <c>-t &lt;seconds&gt;</c> string, or <see cref="string.Empty"/>.</returns>
+        public string GetCueDurationCommandLineParameter(EncodingJobInfo state)
+        {
+            var cueStartTicks = state.MediaSource?.StartPositionTicks ?? 0;
+            if (cueStartTicks > 0 && state.RunTimeTicks.HasValue)
+            {
+                // The user's StartTimeTicks is a seek position WITHIN the track.
+                // Remaining duration = track duration - user seek within the track.
+                var userSeekTicks = state.BaseRequest.StartTimeTicks ?? 0;
+                var remainingTicks = state.RunTimeTicks.Value;
+                if (remainingTicks > 0)
+                {
+                    var remainingSecs = Math.Round(TimeSpan.FromTicks(remainingTicks).TotalSeconds, 3);
+                    return string.Format(CultureInfo.InvariantCulture, "-start_at_zero -t {0}", remainingSecs.ToString(CultureInfo.InvariantCulture));
+                }
+            }
+
+            return string.Empty;
+        }
+
+        /// <summary>
+        /// Builds the ffmpeg command line for a static download of a CUE sheet track.
+        /// All audio streams from the source file are mapped (<c>-map 0:a</c>), input metadata
+        /// is suppressed (<c>-map_metadata -1</c>), and per-track tags supplied via
+        /// <paramref name="metadataArgs"/> are written to the output.  The audio is stream-copied
+        /// (<c>-c:a copy</c>) for lossless, frame-boundary-unaware extraction; for FLAC sources
+        /// being extracted to FLAC the codec is set to <c>flac</c> instead so that the encoder
+        /// produces a file whose sample boundaries align exactly with the <c>-ss</c> / <c>-t</c>
+        /// parameters (FLAC frames are not necessarily aligned to arbitrary time positions).
+        /// </summary>
+        /// <param name="state">The current encoding job info.</param>
+        /// <param name="encodingOptions">Server-level encoding options.</param>
+        /// <param name="outputPath">Full path of the output file.</param>
+        /// <param name="metadataArgs">
+        /// Zero or more <c>-metadata key=value</c> arguments built by the caller, or
+        /// an empty string if no per-track metadata is available.
+        /// </param>
+        /// <returns>A complete ffmpeg argument string.</returns>
+        public string GetCueTrackStaticDownloadCommandLine(
+            EncodingJobInfo state,
+            EncodingOptions encodingOptions,
+            string outputPath,
+            string metadataArgs = null)
+        {
+            // FLAC uses variable-size frames; a stream-copy cut may not start/end on a frame
+            // boundary, which ffmpeg silently rounds to the nearest frame.  Re-encoding with the
+            // FLAC codec is lossless and produces a file that begins/ends exactly at the requested
+            // sample position.
+            var inputExt = Path.GetExtension(state.MediaPath).TrimStart('.').ToLowerInvariant();
+            var outputExt = Path.GetExtension(outputPath).TrimStart('.').ToLowerInvariant();
+            var isFlacToFlac = string.Equals(inputExt, "flac", StringComparison.OrdinalIgnoreCase)
+                            && string.Equals(outputExt, "flac", StringComparison.OrdinalIgnoreCase);
+
+            // Stream copy is zero-loss and fast; FLAC→FLAC re-encodes losslessly for precision.
+            var audioCodec = isFlacToFlac ? "-c:a flac" : "-c:a copy";
+
+            var inputModifier = GetInputModifier(state, encodingOptions, null);
+            var durationParam = GetCueDurationCommandLineParameter(state);
+
+            var suffix = new StringBuilder();
+            if (!string.IsNullOrEmpty(metadataArgs))
+            {
+                suffix.Append(' ').Append(metadataArgs);
+            }
+
+            if (!string.IsNullOrEmpty(durationParam))
+            {
+                suffix.Append(' ').Append(durationParam);
+            }
+
+            return string.Format(
+                CultureInfo.InvariantCulture,
+                "{0} {1} -map 0:a {2} -map_metadata -1{3} -y \"{4}\"",
+                inputModifier,
+                GetInputArgument(state, encodingOptions, null),
+                audioCodec,
+                suffix,
+                outputPath).Trim();
         }
 
         public static int FindIndex(IReadOnlyList<MediaStream> mediaStreams, MediaStream streamToFind)

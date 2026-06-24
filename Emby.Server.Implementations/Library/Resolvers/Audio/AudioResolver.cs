@@ -6,6 +6,7 @@ using System;
 using System.Collections.Generic;
 using System.IO;
 using System.Linq;
+using ATL;
 using Emby.Naming.Audio;
 using Emby.Naming.AudioBook;
 using Emby.Naming.Common;
@@ -66,6 +67,12 @@ namespace Emby.Server.Implementations.Library.Resolvers.Audio
                 return ResolveMultipleAudio(parent, files, true);
             }
 
+            // For music libraries and unspecified (mixed) libraries, handle .cue files
+            if (collectionType == CollectionType.music || collectionType is null)
+            {
+                return ResolveMultipleCue(files, _namingOptions);
+            }
+
             return null;
         }
 
@@ -98,7 +105,7 @@ namespace Emby.Server.Implementations.Library.Resolvers.Audio
 
                 if (extension.Equals(".cue", StringComparison.OrdinalIgnoreCase))
                 {
-                    // if audio file exists of same name, return null
+                    // .cue files are handled by the multi-item resolver; skip individual resolution
                     return null;
                 }
 
@@ -137,6 +144,147 @@ namespace Emby.Server.Implementations.Library.Resolvers.Audio
             }
 
             return null;
+        }
+
+        /// <summary>
+        /// Resolves CUE data (external .cue files and embedded CUESHEET tags) in a file list and
+        /// creates Audio items for each track.  Audio files that are referenced by CUE data are
+        /// excluded from ExtraFiles so they do not appear as duplicate standalone items.
+        /// </summary>
+        private static MultiItemResolverResult ResolveMultipleCue(List<FileSystemMetadata> files, NamingOptions namingOptions)
+        {
+            var cueFiles = files
+                .Where(f => !f.IsDirectory && Path.GetExtension(f.Name).Equals(".cue", StringComparison.OrdinalIgnoreCase))
+                .ToList();
+
+            var result = new MultiItemResolverResult();
+
+            // Track which audio file paths are "claimed" by a CUE sheet (external or embedded)
+            var referencedAudioPaths = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+            // 1. Process external .cue files
+            foreach (var cueFile in cueFiles)
+            {
+                var sheet = CueSheetParser.Parse(cueFile.FullName);
+                if (sheet is null || sheet.Tracks.Count == 0)
+                {
+                    continue;
+                }
+
+                AddTracksFromSheet(sheet, result, referencedAudioPaths);
+            }
+
+            // 2. For audio files not already claimed by an external .cue, check for an embedded CUESHEET tag
+            foreach (var file in files)
+            {
+                if (file.IsDirectory)
+                {
+                    continue;
+                }
+
+                var ext = Path.GetExtension(file.Name);
+                if (ext.Equals(".cue", StringComparison.OrdinalIgnoreCase))
+                {
+                    continue;
+                }
+
+                if (referencedAudioPaths.Contains(file.FullName))
+                {
+                    // Already claimed by an external .cue file
+                    continue;
+                }
+
+                if (!AudioFileParser.IsAudioFile(file.FullName, namingOptions))
+                {
+                    // Not a recognised audio file
+                    continue;
+                }
+
+                // Use ATL to read only the tags (no audio data) looking for an embedded CUESHEET tag.
+                // ATL.Track with a file path reads metadata lazily; we only access AdditionalFields.
+                try
+                {
+                    var atlTrack = new Track(file.FullName);
+                    if (atlTrack.AdditionalFields.TryGetValue("CUESHEET", out var embeddedCue)
+                        && !string.IsNullOrWhiteSpace(embeddedCue))
+                    {
+                        var sheet = CueSheetParser.ParseContent(embeddedCue, file.FullName);
+                        if (sheet is not null && sheet.Tracks.Count > 0)
+                        {
+                            AddTracksFromSheet(sheet, result, referencedAudioPaths);
+                        }
+                    }
+                }
+                catch (IOException)
+                {
+                    // File read failure — skip this file silently
+                }
+                catch (UnauthorizedAccessException)
+                {
+                    // Permission denied — skip this file silently
+                }
+            }
+
+            if (result.Items.Count == 0)
+            {
+                // Neither external .cue files nor embedded CUESHEET tags produced any tracks —
+                // let normal per-file resolution handle everything.
+                return null;
+            }
+
+            // Files NOT referenced by any CUE sheets (and not the .cue files themselves) are extra
+            foreach (var file in files)
+            {
+                if (file.IsDirectory)
+                {
+                    result.ExtraFiles.Add(file);
+                }
+                else if (!cueFiles.Contains(file)
+                    && !referencedAudioPaths.Contains(file.FullName))
+                {
+                    result.ExtraFiles.Add(file);
+                }
+            }
+
+            return result;
+        }
+
+        /// <summary>
+        /// Creates Audio items from all tracks in <paramref name="sheet"/> and adds them to
+        /// <paramref name="result"/>. Also registers each track's source file in
+        /// <paramref name="referencedAudioPaths"/> so it is not surfaced as a standalone item.
+        /// </summary>
+        private static void AddTracksFromSheet(
+            CueSheet sheet,
+            MultiItemResolverResult result,
+            HashSet<string> referencedAudioPaths)
+        {
+            foreach (var track in sheet.Tracks)
+            {
+                if (string.IsNullOrEmpty(track.SourceFile))
+                {
+                    continue;
+                }
+
+                referencedAudioPaths.Add(track.SourceFile);
+
+                var virtualPath = CueSheetParser.BuildCuePath(track.SourceFile, track.Number);
+
+                var audioItem = new MediaBrowser.Controller.Entities.Audio.Audio
+                {
+                    Path = virtualPath,
+                    Name = string.IsNullOrEmpty(track.Title) ? $"Track {track.Number:D2}" : track.Title,
+                    IndexNumber = track.Number,
+                    Album = sheet.Title,
+                    Artists = [string.IsNullOrEmpty(track.Performer) ? sheet.Performer : track.Performer],
+                    AlbumArtists = [sheet.Performer],
+                    StartPositionTicks = track.StartPositionTicks,
+                    RunTimeTicks = track.DurationTicks,
+                    IsInMixedFolder = true
+                };
+
+                result.Items.Add(audioItem);
+            }
         }
 
         private AudioBook FindAudioBook(ItemResolveArgs args, bool parseName)

@@ -217,6 +217,14 @@ public class MediaInfoHelper
             mediaSource.SupportsDirectPlay = false;
         }
 
+        // CUE sheet tracks must always be transcoded: they require a precise seek offset and
+        // duration limit that clients cannot apply when playing the source file directly.
+        if (mediaSource.StartPositionTicks.HasValue && mediaSource.StartPositionTicks.Value > 0)
+        {
+            mediaSource.SupportsDirectPlay = false;
+            mediaSource.SupportsDirectStream = false;
+        }
+
         if (!enableDirectStream || !allowVideoStreamCopy)
         {
             mediaSource.SupportsDirectStream = false;
@@ -274,6 +282,14 @@ public class MediaInfoHelper
                 streamInfo.PlayMethod == PlayMethod.DirectStream
                 || mediaSource.TranscodingContainer is not null
                 || profile.TranscodingProfiles.Any(i => i.Type == streamInfo.MediaType && i.Context == options.Context);
+
+            // CUE sheet tracks must always be transcoded regardless of the stream builder decision.
+            if (mediaSource.StartPositionTicks.HasValue && mediaSource.StartPositionTicks.Value > 0)
+            {
+                mediaSource.SupportsDirectPlay = false;
+                mediaSource.SupportsDirectStream = false;
+                mediaSource.SupportsTranscoding = true;
+            }
 
             if (item is Audio)
             {

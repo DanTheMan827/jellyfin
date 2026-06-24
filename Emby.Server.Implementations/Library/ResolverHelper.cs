@@ -1,6 +1,7 @@
 using System;
 using System.IO;
 using System.Linq;
+using Emby.Naming.Audio;
 using MediaBrowser.Controller.Entities;
 using MediaBrowser.Controller.Library;
 using MediaBrowser.Controller.Providers;
@@ -38,8 +39,12 @@ namespace Emby.Server.Implementations.Library
             item.IsLocked = item.Path.Contains("[dontfetchmeta]", StringComparison.OrdinalIgnoreCase) ||
                 item.GetParents().Any(i => i.IsLocked);
 
+            // For CUE sheet track items, the Path contains a virtual suffix (e.g. "album.flac::cue::01").
+            // Strip it to get the actual file path for the file system lookup.
+            var physicalPath = CueSheetParser.GetPhysicalPath(item.Path);
+
             // Make sure DateCreated and DateModified have values
-            var fileInfo = directoryService.GetFileSystemEntry(item.Path);
+            var fileInfo = directoryService.GetFileSystemEntry(physicalPath);
             if (fileInfo is null)
             {
                 return false;

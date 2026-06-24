@@ -26,7 +26,7 @@ namespace Jellyfin.Server.Implementations.Item;
 /// <summary>
 /// Handles mapping between BaseItemEntity (database) and BaseItemDto (domain) objects.
 /// </summary>
-internal static class BaseItemMapper
+public static class BaseItemMapper
 {
     /// <summary>
     /// This holds all the types in the running assemblies
@@ -60,6 +60,7 @@ internal static class BaseItemMapper
         dto.SortName = entity.SortName;
         dto.ForcedSortName = entity.ForcedSortName;
         dto.RunTimeTicks = entity.RunTimeTicks;
+        dto.StartPositionTicks = entity.StartPositionTicks;
         dto.PreferredMetadataLanguage = entity.PreferredMetadataLanguage;
         dto.PreferredMetadataCountryCode = entity.PreferredMetadataCountryCode;
         dto.IsInMixedFolder = entity.IsInMixedFolder;
@@ -236,6 +237,7 @@ internal static class BaseItemMapper
         entity.SortName = dto.SortName;
         entity.ForcedSortName = dto.ForcedSortName;
         entity.RunTimeTicks = dto.RunTimeTicks;
+        entity.StartPositionTicks = dto.StartPositionTicks;
         entity.PreferredMetadataLanguage = dto.PreferredMetadataLanguage;
         entity.PreferredMetadataCountryCode = dto.PreferredMetadataCountryCode;
         entity.IsInMixedFolder = dto.IsInMixedFolder;

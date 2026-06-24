@@ -55,6 +55,13 @@ namespace MediaBrowser.Model.Dto
 
         public long? RunTimeTicks { get; set; }
 
+        /// <summary>
+        /// Gets or sets the start position within the source file (in ticks).
+        /// Used for CUE sheet tracks to indicate where in the source audio file this track begins.
+        /// When set, the encoding engine will use this as a fixed offset added to any user-requested seek position.
+        /// </summary>
+        public long? StartPositionTicks { get; set; }
+
         public bool ReadAtNativeFramerate { get; set; }
 
         public bool IgnoreDts { get; set; }
