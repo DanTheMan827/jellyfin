@@ -7924,11 +7924,11 @@ namespace MediaBrowser.Controller.MediaEncoding
                 // The user's StartTimeTicks is a seek position WITHIN the track.
                 // Remaining duration = track duration - user seek within the track.
                 var userSeekTicks = state.BaseRequest.StartTimeTicks ?? 0;
-                var remainingTicks = state.RunTimeTicks.Value - userSeekTicks;
+                var remainingTicks = state.RunTimeTicks.Value;
                 if (remainingTicks > 0)
                 {
                     var remainingSecs = Math.Round(TimeSpan.FromTicks(remainingTicks).TotalSeconds, 3);
-                    return string.Format(CultureInfo.InvariantCulture, "-t {0}", remainingSecs.ToString(CultureInfo.InvariantCulture));
+                    return string.Format(CultureInfo.InvariantCulture, "-start_at_zero -t {0}", remainingSecs.ToString(CultureInfo.InvariantCulture));
                 }
             }
 

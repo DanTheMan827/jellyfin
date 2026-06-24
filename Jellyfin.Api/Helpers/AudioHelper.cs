@@ -205,7 +205,18 @@ public class AudioHelper
             parts.Add(FormatMetadataArg("title", item.Name));
         }
 
-        var artist = item.Artists?.FirstOrDefault() ?? item.AlbumArtists?.FirstOrDefault();
+        string? artist = default;
+
+        if (item.Artists.Count > 0)
+        {
+            artist = item.Artists[0];
+        }
+
+        if (artist == null && item.AlbumArtists.Count > 0)
+        {
+            artist = item.AlbumArtists[0];
+        }
+
         if (!string.IsNullOrEmpty(artist))
         {
             parts.Add(FormatMetadataArg("artist", artist));
