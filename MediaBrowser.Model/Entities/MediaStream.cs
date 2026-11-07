@@ -644,13 +644,32 @@ namespace MediaBrowser.Model.Entities
             }
         }
 
+        [JsonIgnore]
+        public bool IsVobSubSubtitleStream
+        {
+            get
+            {
+                if (Type != MediaStreamType.Subtitle)
+                {
+                    return false;
+                }
+
+                if (string.IsNullOrEmpty(Codec) && !IsExternal)
+                {
+                    return false;
+                }
+
+                return IsVobSubFormat(Codec);
+            }
+        }
+
         /// <summary>
         /// Gets a value indicating whether this is a subtitle steam that is extractable by ffmpeg.
         /// All text-based and pgs subtitles can be extracted.
         /// </summary>
         /// <value><c>true</c> if this is a extractable subtitle steam otherwise, <c>false</c>.</value>
         [JsonIgnore]
-        public bool IsExtractableSubtitleStream => IsTextSubtitleStream || IsPgsSubtitleStream;
+        public bool IsExtractableSubtitleStream => IsTextSubtitleStream || IsPgsSubtitleStream || IsVobSubSubtitleStream;
 
         /// <summary>
         /// Gets or sets a value indicating whether [supports external stream].
@@ -728,6 +747,7 @@ namespace MediaBrowser.Model.Entities
             return codec.Contains("microdvd", StringComparison.OrdinalIgnoreCase)
                    || (!codec.Contains("pgs", StringComparison.OrdinalIgnoreCase)
                        && !codec.Contains("dvdsub", StringComparison.OrdinalIgnoreCase)
+                       && !codec.Contains("vobsub", StringComparison.OrdinalIgnoreCase)
                        && !codec.Contains("dvbsub", StringComparison.OrdinalIgnoreCase)
                        && !string.Equals(codec, "sup", StringComparison.OrdinalIgnoreCase)
                        && !string.Equals(codec, "sub", StringComparison.OrdinalIgnoreCase));
@@ -739,6 +759,14 @@ namespace MediaBrowser.Model.Entities
 
             return codec.Contains("pgs", StringComparison.OrdinalIgnoreCase)
                    || string.Equals(codec, "sup", StringComparison.OrdinalIgnoreCase);
+        }
+
+        public static bool IsVobSubFormat(string format)
+        {
+            string codec = format ?? string.Empty;
+
+            return codec.Contains("dvdsub", StringComparison.OrdinalIgnoreCase)
+                   || codec.Contains("vobsub", StringComparison.OrdinalIgnoreCase);
         }
 
         public bool SupportsSubtitleConversionTo(string toCodec)
@@ -782,6 +810,11 @@ namespace MediaBrowser.Model.Entities
                 return (VideoRange.Unknown, VideoRangeType.Unknown);
             }
 
+            var isPq = string.Equals(ColorTransfer, "smpte2084", StringComparison.OrdinalIgnoreCase);
+            var isHlg = string.Equals(ColorTransfer, "arib-std-b67", StringComparison.OrdinalIgnoreCase);
+            // Invalid DV only retains HDR when the base layer explicitly signals PQ or HLG.
+            var baseVideoRange = isPq || isHlg ? VideoRange.HDR : VideoRange.SDR;
+
             var codecTag = CodecTag;
             var dvProfile = DvProfile;
             var rpuPresentFlag = RpuPresentFlag == 1;
@@ -806,7 +839,7 @@ namespace MediaBrowser.Model.Entities
                         4 => (VideoRange.HDR, VideoRangeType.DOVIWithHLG),
                         2 => (VideoRange.SDR, VideoRangeType.DOVIWithSDR),
                         // Out of Dolby Spec files should be marked as invalid
-                        _ => (VideoRange.HDR, VideoRangeType.DOVIInvalid)
+                        _ => (baseVideoRange, VideoRangeType.DOVIInvalid)
                     },
                     7 => (VideoRange.HDR, VideoRangeType.DOVIWithEL),
                     10 => dvBlCompatId switch
@@ -816,10 +849,25 @@ namespace MediaBrowser.Model.Entities
                         2 => (VideoRange.SDR, VideoRangeType.DOVIWithSDR),
                         4 => (VideoRange.HDR, VideoRangeType.DOVIWithHLG),
                         // Out of Dolby Spec files should be marked as invalid
-                        _ => (VideoRange.HDR, VideoRangeType.DOVIInvalid)
+                        _ => (baseVideoRange, VideoRangeType.DOVIInvalid)
                     },
                     _ => (VideoRange.SDR, VideoRangeType.SDR)
                 };
+
+                var expectedTransfer = dvRangeSet.Item2 switch
+                {
+                    VideoRangeType.DOVIWithHDR10 or VideoRangeType.DOVIWithEL => "smpte2084",
+                    VideoRangeType.DOVIWithHLG => "arib-std-b67",
+                    _ => null
+                };
+
+                if (expectedTransfer is not null
+                    && (!string.Equals(ColorSpace, "bt2020nc", StringComparison.OrdinalIgnoreCase)
+                        || !string.Equals(ColorTransfer, expectedTransfer, StringComparison.OrdinalIgnoreCase)
+                        || !string.Equals(ColorPrimaries, "bt2020", StringComparison.OrdinalIgnoreCase)))
+                {
+                    return (baseVideoRange, VideoRangeType.DOVIInvalid);
+                }
 
                 if (Hdr10PlusPresentFlag == true)
                 {
@@ -834,13 +882,11 @@ namespace MediaBrowser.Model.Entities
                 return dvRangeSet;
             }
 
-            var colorTransfer = ColorTransfer;
-
-            if (string.Equals(colorTransfer, "smpte2084", StringComparison.OrdinalIgnoreCase))
+            if (isPq)
             {
                 return Hdr10PlusPresentFlag == true ? (VideoRange.HDR, VideoRangeType.HDR10Plus) : (VideoRange.HDR, VideoRangeType.HDR10);
             }
-            else if (string.Equals(colorTransfer, "arib-std-b67", StringComparison.OrdinalIgnoreCase))
+            else if (isHlg)
             {
                 return (VideoRange.HDR, VideoRangeType.HLG);
             }

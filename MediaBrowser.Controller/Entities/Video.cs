@@ -10,6 +10,7 @@ using System.Text.Json.Serialization;
 using System.Threading;
 using System.Threading.Tasks;
 using Jellyfin.Data.Enums;
+using Jellyfin.Database.Implementations.Entities;
 using Jellyfin.Extensions;
 using MediaBrowser.Controller.Library;
 using MediaBrowser.Controller.LiveTv;
@@ -33,11 +34,11 @@ namespace MediaBrowser.Controller.Entities
     {
         public Video()
         {
-            AdditionalParts = Array.Empty<string>();
-            LocalAlternateVersions = Array.Empty<string>();
-            SubtitleFiles = Array.Empty<string>();
-            AudioFiles = Array.Empty<string>();
-            LinkedAlternateVersions = Array.Empty<LinkedChild>();
+            AdditionalParts = [];
+            LocalAlternateVersions = [];
+            SubtitleFiles = [];
+            AudioFiles = [];
+            LinkedAlternateVersions = [];
         }
 
         [JsonIgnore]
@@ -134,6 +135,40 @@ namespace MediaBrowser.Controller.Entities
         public IsoType? IsoType { get; set; }
 
         /// <summary>
+        /// Gets or sets the 1-based playback title number to use when playing a DVD/Blu-ray ISO or directory.
+        /// When null, the default (longest) title is used.
+        /// </summary>
+        /// <value>The playback title number, or null for the default title.</value>
+        public int? IsoPlaybackTitle { get; set; }
+
+        /// <summary>
+        /// Gets or sets the full path of the ISO image or disc folder that a disc reference points to.
+        /// Only used when <see cref="IsDiscReference"/> is <c>true</c>.
+        /// </summary>
+        /// <value>The referenced source path, or <c>null</c> if the reference is invalid.</value>
+        public string DiscReferenceSource { get; set; }
+
+        /// <summary>
+        /// Gets or sets the title/playlist number fixed by a disc reference.
+        /// When set it always wins over the automatically selected <see cref="IsoPlaybackTitle"/>.
+        /// </summary>
+        /// <value>The referenced title number, or <c>null</c> to use the longest title.</value>
+        public int? DiscReferenceIndex { get; set; }
+
+        /// <summary>
+        /// Gets or sets a value indicating whether this item is a disc reference: a <c>.strm</c> file whose entry
+        /// uses the <c>dvd://</c> or <c>bluray://</c> scheme. See <see cref="DiscReference"/>.
+        /// </summary>
+        public bool IsDiscReference { get; set; }
+
+        /// <summary>
+        /// Gets the path of the actual media: the referenced ISO image or disc folder for a disc
+        /// reference, otherwise <see cref="BaseItem.Path"/>.
+        /// </summary>
+        [JsonIgnore]
+        public string MediaPath => IsDiscReference && !string.IsNullOrEmpty(DiscReferenceSource) ? DiscReferenceSource : Path;
+
+        /// <summary>
         /// Gets or sets the video3 D format.
         /// </summary>
         /// <value>The video3 D format.</value>
@@ -206,7 +241,8 @@ namespace MediaBrowser.Controller.Entities
                     return System.IO.Path.GetDirectoryName(Path);
                 }
 
-                if (!IsPlaceHolder)
+                // A disc reference is a .strm file even when it points at a disc folder.
+                if (!IsPlaceHolder && !IsDiscReference)
                 {
                     if (VideoType == VideoType.BluRay || VideoType == VideoType.Dvd)
                     {
@@ -225,7 +261,7 @@ namespace MediaBrowser.Controller.Entities
             {
                 if (IsFileProtocol)
                 {
-                    if (VideoType == VideoType.BluRay || VideoType == VideoType.Dvd)
+                    if ((VideoType == VideoType.BluRay || VideoType == VideoType.Dvd) && !IsDiscReference)
                     {
                         return System.IO.Path.GetFileName(Path);
                     }
@@ -253,7 +289,7 @@ namespace MediaBrowser.Controller.Entities
 
         private int GetMediaSourceCount(HashSet<Guid> callstack = null)
         {
-            callstack ??= new();
+            callstack ??= [];
             if (PrimaryVersionId.HasValue)
             {
                 var item = LibraryManager.GetItemById(PrimaryVersionId.Value);
@@ -276,6 +312,17 @@ namespace MediaBrowser.Controller.Entities
             var linkedVersionCount = LibraryManager.GetLinkedAlternateVersions(this).Count();
             var localVersionCount = LibraryManager.GetLocalAlternateVersionIds(this).Count();
             return linkedVersionCount + localVersionCount + 1;
+        }
+
+        /// <inheritdoc />
+        public override string GetInheritedOriginalLanguage()
+        {
+            if (ExtraType.GetValueOrDefault() == Model.Entities.ExtraType.Trailer)
+            {
+                return GetOwner()?.GetInheritedOriginalLanguage();
+            }
+
+            return OriginalLanguage ?? GetOwner()?.GetInheritedOriginalLanguage();
         }
 
         public override List<string> GetUserDataKeys()
@@ -323,6 +370,102 @@ namespace MediaBrowser.Controller.Entities
             PresentationUniqueKey = CreatePresentationUniqueKey();
         }
 
+        /// <summary>
+        /// Marks the played status of this video and propagates it to its alternate versions.
+        /// </summary>
+        /// <param name="user">The user.</param>
+        /// <param name="datePlayed">The date played.</param>
+        /// <param name="resetPosition">if set to <c>true</c> [reset position].</param>
+        public override void MarkPlayed(User user, DateTime? datePlayed, bool resetPosition)
+        {
+            base.MarkPlayed(user, datePlayed, resetPosition);
+            PropagatePlayedState(user, true, resetPosition);
+        }
+
+        /// <summary>
+        /// Marks this video unplayed and propagates the change to its alternate versions.
+        /// </summary>
+        /// <param name="user">The user.</param>
+        public override void MarkUnplayed(User user)
+        {
+            base.MarkUnplayed(user);
+
+            // MarkUnplayed always clears the position on this video, so reset the versions too.
+            PropagatePlayedState(user, false, true);
+        }
+
+        /// <summary>
+        /// Propagates the played status to every alternate version of this video.
+        /// </summary>
+        /// <param name="user">The user.</param>
+        /// <param name="played">The played status to apply to the alternate versions.</param>
+        /// <param name="resetPosition">When marking played, controls whether each version's resume point
+        /// is also reset (<c>true</c>) or left untouched (<c>false</c>). Ignored when marking unplayed,
+        /// which always fully resets every version.</param>
+        public void PropagatePlayedState(User user, bool played, bool resetPosition = true)
+        {
+            ArgumentNullException.ThrowIfNull(user);
+
+            if (!PrimaryVersionId.HasValue && LinkedAlternateVersions.Length == 0 && !HasLocalAlternateVersions)
+            {
+                return;
+            }
+
+            foreach (var (item, _) in GetAllItemsForMediaSources())
+            {
+                if (item.Id.Equals(Id) || item is not Video)
+                {
+                    continue;
+                }
+
+                if (played)
+                {
+                    var dto = new UpdateUserItemDataDto { Played = true };
+                    if (resetPosition)
+                    {
+                        dto.PlaybackPositionTicks = 0;
+                    }
+
+                    // SaveUserData only writes the fields set on the DTO, so play count and other state are preserved.
+                    UserDataManager.SaveUserData(user, item, dto, UserDataSaveReason.TogglePlayed);
+                }
+                else
+                {
+                    var data = UserDataManager.GetUserData(user, item);
+                    if (data is null)
+                    {
+                        continue;
+                    }
+
+                    ResetPlayedState(data);
+                    UserDataManager.SaveUserData(user, item, data, UserDataSaveReason.TogglePlayed, CancellationToken.None);
+                }
+            }
+        }
+
+        /// <summary>
+        /// Gets this video together with all of its alternate versions (local and linked and, when this
+        /// is itself an alternate, the primary and the primary's other versions), deduplicated.
+        /// </summary>
+        /// <returns>This video and every alternate version of it.</returns>
+        public IReadOnlyList<Video> GetAllVersions()
+        {
+            return GetAllItemsForMediaSources()
+                .Select(i => i.Item)
+                .OfType<Video>()
+                .ToList();
+        }
+
+        /// <summary>
+        /// Gets the alternate version of this video that matches the supplied item id.
+        /// </summary>
+        /// <param name="itemId">The version item id (the playback media source id).</param>
+        /// <returns>The matching version, or <c>null</c> when the id is not a version of this video.</returns>
+        public Video GetAlternateVersion(Guid itemId)
+        {
+            return GetAllVersions().FirstOrDefault(i => i.Id.Equals(itemId));
+        }
+
         public override string CreatePresentationUniqueKey()
         {
             if (PrimaryVersionId.HasValue)
@@ -335,7 +478,8 @@ namespace MediaBrowser.Controller.Entities
 
         public override bool CanDownload()
         {
-            if (VideoType == VideoType.Dvd || VideoType == VideoType.BluRay)
+            // Downloading a disc reference would only return the small .strm file.
+            if (VideoType == VideoType.Dvd || VideoType == VideoType.BluRay || IsDiscReference)
             {
                 return false;
             }
@@ -379,14 +523,83 @@ namespace MediaBrowser.Controller.Entities
         /// <summary>
         /// Gets the additional parts.
         /// </summary>
+        /// <param name="user">The user to apply parental restrictions for, or <c>null</c> to skip restriction checks.</param>
         /// <returns>IEnumerable{Video}.</returns>
-        public IOrderedEnumerable<Video> GetAdditionalParts()
+        public IOrderedEnumerable<Video> GetAdditionalParts(User user = null)
         {
             return GetAdditionalPartIds()
-                .Select(i => LibraryManager.GetItemById(i))
-                .Where(i => i is not null)
-                .OfType<Video>()
+                .Select(i => LibraryManager.GetItemById<Video>(i))
+                .Where(i => i is not null && (user is null || i.IsVisible(user)))
                 .OrderBy(i => i.SortName);
+        }
+
+        /// <summary>
+        /// Makes this <c>.strm</c> item a disc reference.
+        /// </summary>
+        /// <param name="reference">The parsed reference, or <c>null</c> if the reference is invalid,
+        /// in which case the item becomes a placeholder.</param>
+        /// <returns><c>true</c> if anything changed.</returns>
+        public bool ApplyDiscReference(DiscReference reference)
+        {
+            return reference is null
+                ? SetDiscReference(null, null, VideoType.VideoFile, null, true)
+                : SetDiscReference(reference.SourcePath, reference.Index, reference.VideoType, reference.IsoType, false);
+        }
+
+        /// <summary>
+        /// Turns a former disc reference back into an ordinary <c>.strm</c> item.
+        /// </summary>
+        /// <returns><c>true</c> if anything changed.</returns>
+        public bool ClearDiscReference()
+        {
+            if (!IsDiscReference)
+            {
+                return false;
+            }
+
+            IsDiscReference = false;
+            IsShortcut = true;
+            DiscReferenceSource = null;
+            DiscReferenceIndex = null;
+            VideoType = VideoType.VideoFile;
+            IsoType = null;
+            IsoPlaybackTitle = null;
+            IsPlaceHolder = false;
+            return true;
+        }
+
+        private bool SetDiscReference(string source, int? index, VideoType videoType, IsoType? isoType, bool isPlaceHolder)
+        {
+            var sourceChanged = !IsDiscReference || !string.Equals(DiscReferenceSource, source, StringComparison.Ordinal);
+
+            // Keep a previously detected disc type unless the source changed or the file now declares one.
+            IsoType? newIsoType = videoType == VideoType.Iso
+                ? isoType ?? (sourceChanged ? null : IsoType)
+                : null;
+
+            // A fixed index always wins. Without one, keep the automatically selected (longest) title unless
+            // the source changed or the index was just removed, so that probing picks the longest title again.
+            var newTitle = index ?? (sourceChanged || DiscReferenceIndex.HasValue ? null : IsoPlaybackTitle);
+
+            var changed = sourceChanged
+                || IsShortcut
+                || DiscReferenceIndex != index
+                || VideoType != videoType
+                || IsoType != newIsoType
+                || IsoPlaybackTitle != newTitle
+                || IsPlaceHolder != isPlaceHolder;
+
+            // The .strm file is played from the referenced disc, not treated as a remote stream.
+            IsDiscReference = true;
+            IsShortcut = false;
+            DiscReferenceSource = source;
+            DiscReferenceIndex = index;
+            VideoType = videoType;
+            IsoType = newIsoType;
+            IsoPlaybackTitle = newTitle;
+            IsPlaceHolder = isPlaceHolder;
+
+            return changed;
         }
 
         internal override ItemUpdateType UpdateFromResolvedItem(BaseItem newItem)
@@ -407,7 +620,21 @@ namespace MediaBrowser.Controller.Entities
                     updateType |= ItemUpdateType.MetadataImport;
                 }
 
-                if (VideoType != newVideo.VideoType)
+                if (newVideo.IsDiscReference)
+                {
+                    if (SetDiscReference(newVideo.DiscReferenceSource, newVideo.DiscReferenceIndex, newVideo.VideoType, newVideo.IsoType, newVideo.IsPlaceHolder))
+                    {
+                        updateType |= ItemUpdateType.MetadataImport;
+                    }
+                }
+                else if (ClearDiscReference())
+                {
+                    // The .strm file no longer holds a disc reference.
+                    IsShortcut = newVideo.IsShortcut;
+                    VideoType = newVideo.VideoType;
+                    updateType |= ItemUpdateType.MetadataImport;
+                }
+                else if (VideoType != newVideo.VideoType)
                 {
                     VideoType = newVideo.VideoType;
                     updateType |= ItemUpdateType.MetadataImport;
@@ -419,7 +646,13 @@ namespace MediaBrowser.Controller.Entities
 
         protected override async Task<bool> RefreshedOwnedItems(MetadataRefreshOptions options, IReadOnlyList<FileSystemMetadata> fileSystemChildren, CancellationToken cancellationToken)
         {
-            var hasChanges = await base.RefreshedOwnedItems(options, fileSystemChildren, cancellationToken).ConfigureAwait(false);
+            var hasChanges = false;
+
+            // The extras of a version group are maintained by its primary.
+            if (!PrimaryVersionId.HasValue)
+            {
+                hasChanges = await base.RefreshedOwnedItems(options, fileSystemChildren, cancellationToken).ConfigureAwait(false);
+            }
 
             // Clean up LocalAlternateVersions - remove paths that no longer exist
             if (LocalAlternateVersions.Length > 0)
@@ -480,8 +713,18 @@ namespace MediaBrowser.Controller.Entities
                 {
                     altVideo.OwnerId = Id;
                     altVideo.SetPrimaryVersionId(Id);
+                    altVideo.IsInMixedFolder = IsInMixedFolder;
                     LibraryManager.CreateItem(altVideo, GetParent());
                 }
+            }
+
+            // A version is resolved on its own, so it does not learn whether the folder it sits in
+            // holds other items. It has to share that with the version it belongs to, before the
+            // refresh below acts on it.
+            if (LibraryManager.GetItemById(id) is Video resolvedVersion && resolvedVersion.IsInMixedFolder != IsInMixedFolder)
+            {
+                resolvedVersion.IsInMixedFolder = IsInMixedFolder;
+                await resolvedVersion.UpdateToRepositoryAsync(ItemUpdateType.MetadataImport, cancellationToken).ConfigureAwait(false);
             }
 
             await RefreshMetadataForOwnedVideo(options, copyTitleMetadata, path, cancellationToken).ConfigureAwait(false);
@@ -563,6 +806,7 @@ namespace MediaBrowser.Controller.Entities
 
                 video.Id = id;
                 video.OwnerId = Id;
+                video.IsInMixedFolder = IsInMixedFolder;
                 LibraryManager.CreateItem(video, parentFolder);
                 newOptions.ForceSave = true;
             }
@@ -630,39 +874,132 @@ namespace MediaBrowser.Controller.Entities
             }).FirstOrDefault();
         }
 
-        protected override IEnumerable<(BaseItem Item, MediaSourceType MediaSourceType)> GetAllItemsForMediaSources()
+        /// <summary>
+        /// Gets the ids of the items whose owned extras belong to this item.
+        /// Extras are linked to a single version but need tp be surfaced for all versions.
+        /// </summary>
+        /// <returns>An array containing the owner ids.</returns>
+        protected override Guid[] GetExtraOwnerIds()
         {
-            var list = new List<(BaseItem, MediaSourceType)>
-            {
-                (this, MediaSourceType.Default)
-            };
+            return GetAllItemsForMediaSources()
+                .Select(i => i.Item.Id)
+                .Distinct()
+                .ToArray();
+        }
 
-            list.AddRange(
-                LibraryManager.GetLinkedAlternateVersions(this)
-                    .Select(i => ((BaseItem)i, MediaSourceType.Grouping)));
+        /// <inheritdoc />
+        protected override Guid[] GetOwnedVersionIds()
+        {
+            // Only the versions that live beside this one in the folder this scan covers. Linked
+            // versions are items of their own and maintain their extras themselves.
+            return [Id, .. LibraryManager.GetLocalAlternateVersionIds(this)];
+        }
 
-            if (PrimaryVersionId.HasValue)
+        /// <inheritdoc />
+        protected override Guid GetOwnerIdForExtra(BaseItem extra)
+        {
+            if (string.IsNullOrEmpty(extra.Path))
             {
-                if (LibraryManager.GetItemById(PrimaryVersionId.Value) is Video primary)
+                return Id;
+            }
+
+            var extraDirectory = System.IO.Path.GetDirectoryName(extra.Path.AsSpan());
+            var extraFileName = System.IO.Path.GetFileNameWithoutExtension(extra.Path.AsSpan());
+
+            var ownerId = Id;
+            var matchedLength = MatchedVersionNameLength(Path, extraDirectory, extraFileName);
+
+            foreach (var versionId in LibraryManager.GetLocalAlternateVersionIds(this))
+            {
+                var version = LibraryManager.GetItemById(versionId);
+                if (version is null)
                 {
-                    var existingIds = list.Select(i => i.Item1.Id).ToList();
-                    list.Add((primary, MediaSourceType.Grouping));
-                    list.AddRange(LibraryManager.GetLinkedAlternateVersions(primary).Where(i => !existingIds.Contains(i.Id)).Select(i => ((BaseItem)i, MediaSourceType.Grouping)));
+                    continue;
+                }
+
+                // "Movie - [2160p]-trailer.mkv" belongs to "Movie - [2160p].mkv" rather than to the
+                // primary version, whose name it also starts with when the primary is plain "Movie.mkv"
+                var length = MatchedVersionNameLength(version.Path, extraDirectory, extraFileName);
+                if (length > matchedLength)
+                {
+                    matchedLength = length;
+                    ownerId = versionId;
                 }
             }
 
-            var localAlternates = list
-                .SelectMany(i =>
-                {
-                    return i.Item1 is Video video ? LibraryManager.GetLocalAlternateVersionIds(video) : Enumerable.Empty<Guid>();
-                })
-                .Select(LibraryManager.GetItemById)
-                .Where(i => i is not null)
+            return ownerId;
+        }
+
+        /// <summary>
+        /// Gets how much of an extra's file name is the name of the given version file, or 0 when the
+        /// extra is not named after it.
+        /// </summary>
+        /// <param name="versionPath">The path of the version.</param>
+        /// <param name="extraDirectory">The directory the extra lives in.</param>
+        /// <param name="extraFileName">The file name of the extra, without extension.</param>
+        /// <returns>The length of the match.</returns>
+        private static int MatchedVersionNameLength(string versionPath, ReadOnlySpan<char> extraDirectory, ReadOnlySpan<char> extraFileName)
+        {
+            if (string.IsNullOrEmpty(versionPath)
+                || !System.IO.Path.GetDirectoryName(versionPath.AsSpan()).Equals(extraDirectory, StringComparison.OrdinalIgnoreCase))
+            {
+                return 0;
+            }
+
+            var versionFileName = System.IO.Path.GetFileNameWithoutExtension(versionPath.AsSpan());
+            if (versionFileName.IsEmpty || !extraFileName.StartsWith(versionFileName, StringComparison.OrdinalIgnoreCase))
+            {
+                return 0;
+            }
+
+            // The version name has to end where the extra's own name begins, so that a version
+            // named "Movie - 4K" does not claim the extras of "Movie - 4Kish"
+            var remainder = extraFileName[versionFileName.Length..];
+
+            return !remainder.IsEmpty && (remainder[0] == ' ' || Array.IndexOf(VersionDelimiters, remainder[0]) >= 0)
+                ? versionFileName.Length
+                : 0;
+        }
+
+        protected override IEnumerable<(BaseItem Item, MediaSourceType MediaSourceType)> GetAllItemsForMediaSources()
+        {
+            var primary = PrimaryVersionId.HasValue
+                ? LibraryManager.GetItemById(PrimaryVersionId.Value) as Video
+                : null;
+
+            var primaryLinked = primary is null
+                ? []
+                : LibraryManager.GetLinkedAlternateVersions(primary).ToList();
+
+            // Grouping marks user-merged (splittable) sources. The primary is only such a source when
+            // this video is linked onto it; for local (file-based) alternates the primary is just
+            // another default source.
+            var primaryType = primaryLinked.Any(i => i.Id.Equals(Id))
+                ? MediaSourceType.Grouping
+                : MediaSourceType.Default;
+
+            // This video and its linked alternates, when this is itself an alternate, the primary and the primary's linked alternates.
+            var grouped = new[] { ((BaseItem)this, MediaSourceType.Default) }
+                .Concat(LibraryManager.GetLinkedAlternateVersions(this).Select(i => ((BaseItem)i, MediaSourceType.Grouping)))
+                .Concat(primary is null
+                    ? []
+                    : primaryLinked.Select(i => ((BaseItem)i, MediaSourceType.Grouping)).Prepend(((BaseItem)primary, primaryType)))
                 .ToList();
 
-            list.AddRange(localAlternates.Select(i => (i, MediaSourceType.Default)));
+            // The local (file-based) alternate versions of every grouped item.
+            var localAlternates = grouped
+                .Select(i => i.Item1)
+                .OfType<Video>()
+                .SelectMany(LibraryManager.GetLocalAlternateVersionIds)
+                .Select(LibraryManager.GetItemById)
+                .Where(i => i is not null)
+                .Select(i => (i, MediaSourceType.Default));
 
-            return list;
+            // Deduplicate
+            return grouped
+                .Concat(localAlternates)
+                .DistinctBy(i => i.Item1.Id)
+                .ToList();
         }
     }
 }

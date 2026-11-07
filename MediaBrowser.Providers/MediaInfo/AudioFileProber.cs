@@ -188,7 +188,7 @@ namespace MediaBrowser.Providers.MediaInfo
             // To properly handle fallback values, we make a clone of those fields when valid.
             var trackTitle = (string.IsNullOrEmpty(track.Title) ? mediaInfo.Name : track.Title)?.Trim();
             var trackAlbum = (string.IsNullOrEmpty(track.Album) ? mediaInfo.Album : track.Album)?.Trim();
-            var trackYear = track.Year is null or 0 ? mediaInfo.ProductionYear : track.Year;
+            var trackYear = track.Year is null or 0 ? mediaInfo.ProductionYear ?? mediaInfo.ContainerCreationDate?.Year : track.Year;
             var trackTrackNumber = track.TrackNumber is null or 0 ? mediaInfo.IndexNumber : track.TrackNumber;
             var trackDiscNumber = track.DiscNumber is null or 0 ? mediaInfo.ParentIndexNumber : track.DiscNumber;
 
@@ -468,6 +468,24 @@ namespace MediaBrowser.Providers.MediaInfo
                 }
             }
 
+            if (audio.AlbumEntity is not null && !audio.AlbumEntity.NormalizationGain.HasValue)
+            {
+                TryGetSanitizedAdditionalFields(track, "REPLAYGAIN_ALBUM_GAIN", out var trackAlbumGainTag);
+
+                if (trackAlbumGainTag is not null)
+                {
+                    if (trackAlbumGainTag.EndsWith("db", StringComparison.OrdinalIgnoreCase))
+                    {
+                        trackAlbumGainTag = trackAlbumGainTag[..^2].Trim();
+                    }
+
+                    if (float.TryParse(trackAlbumGainTag, NumberStyles.Float, CultureInfo.InvariantCulture, out var value) && float.IsFinite(value))
+                    {
+                        audio.AlbumEntity.NormalizationGain = value;
+                    }
+                }
+            }
+
             if (options.ReplaceAllMetadata || !audio.TryGetProviderId(MetadataProvider.MusicBrainzArtist, out _))
             {
                 if ((TryGetSanitizedAdditionalFields(track, "MUSICBRAINZ_ARTISTID", out var musicBrainzArtistTag)
@@ -549,7 +567,7 @@ namespace MediaBrowser.Providers.MediaInfo
             var candidateUnsynchronizedLyric = supportedLyrics.FirstOrDefault(l => l.Format is LyricsInfo.LyricsFormat.UNSYNCHRONIZED or LyricsInfo.LyricsFormat.OTHER && l.UnsynchronizedLyrics is not null);
             var lyrics = candidateSynchronizedLyric is not null ? candidateSynchronizedLyric.FormatSynch() : candidateUnsynchronizedLyric?.UnsynchronizedLyrics;
             if (!string.IsNullOrWhiteSpace(lyrics)
-                && tryExtractEmbeddedLyrics)
+                && (tryExtractEmbeddedLyrics || options.ReplaceAllMetadata))
             {
                 await _lyricManager.SaveLyricAsync(audio, "lrc", lyrics).ConfigureAwait(false);
             }

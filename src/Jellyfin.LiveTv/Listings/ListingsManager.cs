@@ -67,7 +67,7 @@ public class ListingsManager : IListingsManager
         if (index == -1 || string.IsNullOrWhiteSpace(info.Id))
         {
             info.Id = Guid.NewGuid().ToString("N", CultureInfo.InvariantCulture);
-            config.ListingProviders = [..list, info];
+            config.ListingProviders = [.. list, info];
         }
         else
         {
@@ -255,7 +255,7 @@ public class ListingsManager : IListingsManager
                 Name = tunerChannelNumber,
                 Value = providerChannelNumber
             };
-            listingsProviderInfo.ChannelMappings = [..listingsProviderInfo.ChannelMappings, newItem];
+            listingsProviderInfo.ChannelMappings = [.. listingsProviderInfo.ChannelMappings, newItem];
         }
 
         _config.SaveConfiguration("livetv", config);
@@ -352,9 +352,12 @@ public class ListingsManager : IListingsManager
             var xmltvCacheFile = Path.Combine(cachePath, "xmltv", safeId + ".xml");
             try
             {
-                File.Delete(xmltvCacheFile);
+                if (File.Exists(xmltvCacheFile))
+                {
+                    File.Delete(xmltvCacheFile);
+                }
             }
-            catch (IOException ex)
+            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
             {
                 _logger.LogWarning(ex, "Error deleting XMLTV cache file for provider {ProviderId}", safeId);
             }

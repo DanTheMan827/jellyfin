@@ -7,16 +7,24 @@ using System.Text.Json;
 using System.Threading;
 using System.Threading.Tasks;
 using Jellyfin.Data.Enums;
+using Jellyfin.Database.Implementations;
 using Jellyfin.Database.Implementations.Entities;
+using Jellyfin.Database.Implementations.Enums;
+using Jellyfin.Extensions;
 using Jellyfin.Extensions.Json;
+using MediaBrowser.Common.Extensions;
 using MediaBrowser.Controller;
+using MediaBrowser.Controller.Configuration;
 using MediaBrowser.Controller.Dto;
 using MediaBrowser.Controller.Entities;
 using MediaBrowser.Controller.Library;
+using MediaBrowser.Controller.Persistence;
 using MediaBrowser.Model.Configuration;
+using MediaBrowser.Model.Dto;
 using MediaBrowser.Model.Entities;
 using MediaBrowser.Model.IO;
 using MediaBrowser.Model.Querying;
+using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.Logging;
 
 namespace Emby.Server.Implementations.Library.SimilarItems;
@@ -30,6 +38,9 @@ public class SimilarItemsManager : ISimilarItemsManager
     private readonly IServerApplicationPaths _appPaths;
     private readonly ILibraryManager _libraryManager;
     private readonly IFileSystem _fileSystem;
+    private readonly IServerConfigurationManager _serverConfigurationManager;
+    private readonly IDbContextFactory<JellyfinDbContext> _dbProvider;
+    private readonly IItemQueryHelpers _queryHelpers;
     private ISimilarItemsProvider[] _similarItemsProviders = [];
 
     /// <summary>
@@ -39,16 +50,25 @@ public class SimilarItemsManager : ISimilarItemsManager
     /// <param name="appPaths">The server application paths.</param>
     /// <param name="libraryManager">The library manager.</param>
     /// <param name="fileSystem">The file system.</param>
+    /// <param name="serverConfigurationManager">The server configuration manager.</param>
+    /// <param name="dbProvider">The database context factory.</param>
+    /// <param name="queryHelpers">The shared item query helpers.</param>
     public SimilarItemsManager(
         ILogger<SimilarItemsManager> logger,
         IServerApplicationPaths appPaths,
         ILibraryManager libraryManager,
-        IFileSystem fileSystem)
+        IFileSystem fileSystem,
+        IServerConfigurationManager serverConfigurationManager,
+        IDbContextFactory<JellyfinDbContext> dbProvider,
+        IItemQueryHelpers queryHelpers)
     {
         _logger = logger;
         _appPaths = appPaths;
         _libraryManager = libraryManager;
         _fileSystem = fileSystem;
+        _serverConfigurationManager = serverConfigurationManager;
+        _dbProvider = dbProvider;
+        _queryHelpers = queryHelpers;
     }
 
     /// <inheritdoc/>
@@ -117,6 +137,7 @@ public class SimilarItemsManager : ISimilarItemsManager
 
         var allResults = new List<(BaseItem Item, float Score)>();
         var excludeIds = new HashSet<Guid> { item.Id };
+        var excludeKeys = new HashSet<string>(StringComparer.OrdinalIgnoreCase) { item.GetPresentationUniqueKey() };
         foreach (var (providerOrder, provider) in orderedProviders.Index())
         {
             if (allResults.Count >= requestedLimit || cancellationToken.IsCancellationRequested)
@@ -141,7 +162,9 @@ public class SimilarItemsManager : ISimilarItemsManager
 
                     foreach (var (position, resultItem) in items.Index())
                     {
-                        if (excludeIds.Add(resultItem.Id))
+                        var isNewId = excludeIds.Add(resultItem.Id);
+                        var isNewKey = excludeKeys.Add(resultItem.GetPresentationUniqueKey());
+                        if (isNewId && isNewKey)
                         {
                             var score = CalculateScore(null, providerOrder, position);
                             allResults.Add((resultItem, score));
@@ -155,7 +178,7 @@ public class SimilarItemsManager : ISimilarItemsManager
                     var cachedReferences = await TryReadSimilarItemsCacheAsync(cachePath, cancellationToken).ConfigureAwait(false);
                     if (cachedReferences is not null)
                     {
-                        var resolvedItems = ResolveRemoteReferences(cachedReferences, providerOrder, user, dtoOptions, itemKind, excludeIds);
+                        var resolvedItems = ResolveRemoteReferences(cachedReferences, providerOrder, user, dtoOptions, itemKind, excludeIds, excludeKeys);
                         allResults.AddRange(resolvedItems);
                         continue;
                     }
@@ -172,6 +195,7 @@ public class SimilarItemsManager : ISimilarItemsManager
                     // Collect references in batches and resolve against local library.
                     // Stop fetching once we have enough resolved local items.
                     const int BatchSize = 20;
+                    const int MaxRemoteReferenceFetchLimit = 500;
                     var remaining = requestedLimit - allResults.Count;
                     var collectedReferences = new List<SimilarItemReference>();
                     var pendingBatch = new List<SimilarItemReference>();
@@ -183,12 +207,12 @@ public class SimilarItemsManager : ISimilarItemsManager
 
                         if (pendingBatch.Count >= BatchSize)
                         {
-                            var resolvedItems = ResolveRemoteReferences(pendingBatch, providerOrder, user, dtoOptions, itemKind, excludeIds);
+                            var resolvedItems = ResolveRemoteReferences(pendingBatch, providerOrder, user, dtoOptions, itemKind, excludeIds, excludeKeys);
                             allResults.AddRange(resolvedItems);
                             remaining -= resolvedItems.Count;
                             pendingBatch.Clear();
 
-                            if (remaining <= 0)
+                            if (remaining <= 0 || collectedReferences.Count >= MaxRemoteReferenceFetchLimit)
                             {
                                 break;
                             }
@@ -198,7 +222,7 @@ public class SimilarItemsManager : ISimilarItemsManager
                     // Resolve any remaining references in the last partial batch
                     if (pendingBatch.Count > 0)
                     {
-                        var resolvedItems = ResolveRemoteReferences(pendingBatch, providerOrder, user, dtoOptions, itemKind, excludeIds);
+                        var resolvedItems = ResolveRemoteReferences(pendingBatch, providerOrder, user, dtoOptions, itemKind, excludeIds, excludeKeys);
                         allResults.AddRange(resolvedItems);
                     }
 
@@ -218,11 +242,293 @@ public class SimilarItemsManager : ISimilarItemsManager
             }
         }
 
-        return allResults
+        var ordered = allResults
             .OrderByDescending(x => x.Score)
             .Select(x => x.Item)
             .Take(requestedLimit)
             .ToList();
+
+        return await FilterByLibraryAccessAsync(ordered, user, cancellationToken).ConfigureAwait(false);
+    }
+
+    private async Task<IReadOnlyList<BaseItem>> FilterByLibraryAccessAsync(
+        IReadOnlyList<BaseItem> candidates,
+        User? user,
+        CancellationToken cancellationToken)
+    {
+        if (candidates.Count == 0 || user is null)
+        {
+            return candidates;
+        }
+
+        var accessFilter = SimilarItemsAccessFilter.Build(user, _libraryManager);
+
+        // No accessible libraries means nothing to compare against, and an empty TopParentIds set
+        // would disable the filter rather than reject everything.
+        if (accessFilter.TopParentIds.Length == 0)
+        {
+            return candidates;
+        }
+
+        Guid[] candidateIds = [.. candidates.Select(c => c.Id)];
+
+        var dbContext = await _dbProvider.CreateDbContextAsync(cancellationToken).ConfigureAwait(false);
+        await using (dbContext.ConfigureAwait(false))
+        {
+            var baseQuery = dbContext.BaseItems
+                .AsNoTracking()
+                .WhereOneOrMany(candidateIds, e => e.Id);
+
+            baseQuery = _queryHelpers.ApplyAccessFiltering(dbContext, baseQuery, accessFilter);
+
+            var allowedCount = await baseQuery.CountAsync(cancellationToken).ConfigureAwait(false);
+            if (allowedCount == candidates.Count)
+            {
+                return candidates;
+            }
+
+            var allowedIds = await baseQuery
+                .Select(e => e.Id)
+                .ToHashSetAsync(cancellationToken)
+                .ConfigureAwait(false);
+
+            var filtered = candidates.Where(c => allowedIds.Contains(c.Id)).ToList();
+            _logger.LogDebug(
+                "Dropped {Dropped} of {Total} similar-item candidates due to user access filtering",
+                candidates.Count - filtered.Count,
+                candidates.Count);
+
+            return filtered;
+        }
+    }
+
+    /// <inheritdoc/>
+    public async Task<IReadOnlyList<SimilarItemsRecommendation>> GetMovieRecommendationsAsync(
+        User? user,
+        Guid parentId,
+        int categoryLimit,
+        int itemLimit,
+        DtoOptions dtoOptions,
+        CancellationToken cancellationToken)
+    {
+        ArgumentNullException.ThrowIfNull(dtoOptions);
+
+        var recentlyPlayedMovies = _libraryManager.GetItemList(new InternalItemsQuery(user)
+        {
+            IncludeItemTypes = [BaseItemKind.Movie],
+            OrderBy = [(ItemSortBy.DatePlayed, SortOrder.Descending), (ItemSortBy.Random, SortOrder.Descending)],
+            Limit = 7,
+            ParentId = parentId,
+            Recursive = true,
+            IsPlayed = true,
+            EnableGroupByMetadataKey = true,
+            DtoOptions = dtoOptions
+        });
+
+        var itemTypes = new List<BaseItemKind> { BaseItemKind.Movie };
+        if (_serverConfigurationManager.Configuration.EnableExternalContentInSuggestions)
+        {
+            itemTypes.Add(BaseItemKind.Trailer);
+            itemTypes.Add(BaseItemKind.LiveTvProgram);
+        }
+
+        var likedMovies = _libraryManager.GetItemList(new InternalItemsQuery(user)
+        {
+            IncludeItemTypes = itemTypes.ToArray(),
+            IsMovie = true,
+            OrderBy = [(ItemSortBy.Random, SortOrder.Descending)],
+            Limit = 10,
+            IsFavoriteOrLiked = true,
+            ExcludeItemIds = recentlyPlayedMovies.Select(i => i.Id).ToArray(),
+            EnableGroupByMetadataKey = true,
+            ParentId = parentId,
+            Recursive = true,
+            DtoOptions = dtoOptions
+        });
+
+        var mostRecentMovies = recentlyPlayedMovies.Take(Math.Min(recentlyPlayedMovies.Count, 6)).ToList();
+        var recentDirectors = GetPeopleNames(mostRecentMovies, [PersonType.Director]);
+        var recentActors = GetPeopleNames(mostRecentMovies, [PersonType.Actor, PersonType.GuestStar]);
+
+        // Cap baseline items to categoryLimit - the round-robin can't use more categories than that.
+        var recentlyPlayedBaseline = recentlyPlayedMovies.Count > categoryLimit
+            ? recentlyPlayedMovies.Take(categoryLimit).ToList()
+            : recentlyPlayedMovies;
+        var likedBaseline = likedMovies.Count > categoryLimit
+            ? likedMovies.Take(categoryLimit).ToList()
+            : likedMovies;
+
+        var batchQuery = new SimilarItemsQuery
+        {
+            User = user,
+            Limit = itemLimit,
+            DtoOptions = dtoOptions
+        };
+
+        var similarToRecentlyPlayed = await GetSimilarItemsRecommendationsAsync(
+            recentlyPlayedBaseline,
+            RecommendationType.SimilarToRecentlyPlayed,
+            batchQuery,
+            cancellationToken).ConfigureAwait(false);
+
+        var similarToLiked = await GetSimilarItemsRecommendationsAsync(
+            likedBaseline,
+            RecommendationType.SimilarToLikedItem,
+            batchQuery,
+            cancellationToken).ConfigureAwait(false);
+
+        var hasDirectorFromRecentlyPlayed = GetPersonRecommendations(user, recentDirectors, itemLimit, dtoOptions, RecommendationType.HasDirectorFromRecentlyPlayed, itemTypes);
+        var hasActorFromRecentlyPlayed = GetPersonRecommendations(user, recentActors, itemLimit, dtoOptions, RecommendationType.HasActorFromRecentlyPlayed, itemTypes);
+
+        // Use a single enumerator per list, listed twice so MoveNext advances it
+        // twice per round-robin pass (giving these categories double weight).
+        // IMPORTANT: Declare as IEnumerator<T> to box the List<T>.Enumerator struct once;
+        // using var would box separately per list insertion, creating independent copies.
+        IEnumerator<SimilarItemsRecommendation> similarToRecentlyPlayedEnum = similarToRecentlyPlayed.GetEnumerator();
+        IEnumerator<SimilarItemsRecommendation> similarToLikedEnum = similarToLiked.GetEnumerator();
+
+        var categoryTypes = new List<IEnumerator<SimilarItemsRecommendation>>
+        {
+            similarToRecentlyPlayedEnum,
+            similarToRecentlyPlayedEnum,
+            similarToLikedEnum,
+            similarToLikedEnum,
+            hasDirectorFromRecentlyPlayed.GetEnumerator(),
+            hasActorFromRecentlyPlayed.GetEnumerator()
+        };
+
+        var categories = new List<SimilarItemsRecommendation>();
+        while (categories.Count < categoryLimit)
+        {
+            var allEmpty = true;
+            foreach (var category in categoryTypes)
+            {
+                if (category.MoveNext())
+                {
+                    categories.Add(category.Current);
+                    allEmpty = false;
+
+                    if (categories.Count >= categoryLimit)
+                    {
+                        break;
+                    }
+                }
+            }
+
+            if (allEmpty)
+            {
+                break;
+            }
+        }
+
+        return [.. categories.OrderBy(i => i.RecommendationType)];
+    }
+
+    private async Task<IReadOnlyList<SimilarItemsRecommendation>> GetSimilarItemsRecommendationsAsync(
+        IReadOnlyList<BaseItem> baselineItems,
+        RecommendationType recommendationType,
+        SimilarItemsQuery query,
+        CancellationToken cancellationToken)
+    {
+        var batchProvider = _similarItemsProviders
+            .OfType<IBatchLocalSimilarItemsProvider>()
+            .FirstOrDefault();
+
+        if (batchProvider is null || baselineItems.Count == 0)
+        {
+            return [];
+        }
+
+        var batchResults = await batchProvider.GetBatchSimilarItemsAsync(baselineItems, query, cancellationToken).ConfigureAwait(false);
+
+        // Filter once across every category rather than per baseline, so a batch provider costs one
+        // access query no matter how many categories it produced.
+        var allItems = batchResults.Values.SelectMany(items => items).DistinctBy(item => item.Id).ToList();
+        var allowed = await FilterByLibraryAccessAsync(allItems, query.User, cancellationToken).ConfigureAwait(false);
+
+        HashSet<Guid>? allowedIds = allowed.Count == allItems.Count
+            ? null
+            : [.. allowed.Select(item => item.Id)];
+
+        var recommendations = new List<SimilarItemsRecommendation>(baselineItems.Count);
+        foreach (var baseline in baselineItems)
+        {
+            if (!batchResults.TryGetValue(baseline.Id, out var similar) || similar.Count == 0)
+            {
+                continue;
+            }
+
+            if (allowedIds is not null)
+            {
+                similar = similar.Where(item => allowedIds.Contains(item.Id)).ToList();
+                if (similar.Count == 0)
+                {
+                    continue;
+                }
+            }
+
+            recommendations.Add(new SimilarItemsRecommendation
+            {
+                BaselineItemName = baseline.Name,
+                CategoryId = baseline.Id,
+                RecommendationType = recommendationType,
+                Items = similar
+            });
+        }
+
+        return recommendations;
+    }
+
+    private IEnumerable<SimilarItemsRecommendation> GetPersonRecommendations(
+        User? user,
+        IReadOnlyList<string> names,
+        int itemLimit,
+        DtoOptions dtoOptions,
+        RecommendationType type,
+        IReadOnlyList<BaseItemKind> itemTypes)
+    {
+        var personTypes = type == RecommendationType.HasDirectorFromRecentlyPlayed
+            ? [PersonType.Director]
+            : Array.Empty<string>();
+
+        foreach (var name in names)
+        {
+            var items = _libraryManager.GetItemList(new InternalItemsQuery(user)
+            {
+                Person = name,
+                Limit = itemLimit + 2,
+                PersonTypes = personTypes,
+                IncludeItemTypes = itemTypes.ToArray(),
+                IsMovie = true,
+                IsPlayed = false,
+                EnableGroupByMetadataKey = true,
+                DtoOptions = dtoOptions
+            })
+                .DistinctBy(i => i.GetProviderId(MetadataProvider.Imdb) ?? Guid.NewGuid().ToString("N", CultureInfo.InvariantCulture))
+                .Take(itemLimit)
+                .ToList();
+
+            if (items.Count > 0)
+            {
+                yield return new SimilarItemsRecommendation
+                {
+                    BaselineItemName = name,
+                    CategoryId = name.GetMD5(),
+                    RecommendationType = type,
+                    Items = items
+                };
+            }
+        }
+    }
+
+    private IReadOnlyList<string> GetPeopleNames(IReadOnlyList<BaseItem> items, IReadOnlyList<string> personTypes)
+    {
+        var itemIds = items.Select(i => i.Id).ToArray();
+        return _libraryManager.GetPeopleNamesByItems(itemIds, personTypes)
+            .Values
+            .SelectMany(names => names)
+            .Distinct()
+            .ToArray();
     }
 
     private List<(BaseItem Item, float Score)> ResolveRemoteReferences(
@@ -231,14 +537,15 @@ public class SimilarItemsManager : ISimilarItemsManager
         User? user,
         DtoOptions dtoOptions,
         BaseItemKind itemKind,
-        HashSet<Guid> excludeIds)
+        HashSet<Guid> excludeIds,
+        HashSet<string> excludeKeys)
     {
         if (references.Count == 0)
         {
             return [];
         }
 
-        var resolvedById = new Dictionary<Guid, (BaseItem Item, float Score)>();
+        var resolvedByKey = new Dictionary<string, (BaseItem Item, float Score)>(StringComparer.OrdinalIgnoreCase);
         var providerLookup = new Dictionary<(string ProviderName, string ProviderId), (float? Score, int Position)>(StringTupleComparer.Instance);
 
         foreach (var (position, match) in references.Index())
@@ -269,7 +576,13 @@ public class SimilarItemsManager : ISimilarItemsManager
 
         foreach (var item in items)
         {
-            if (excludeIds.Contains(item.Id) || resolvedById.ContainsKey(item.Id))
+            if (excludeIds.Contains(item.Id))
+            {
+                continue;
+            }
+
+            var presentationKey = item.GetPresentationUniqueKey();
+            if (excludeKeys.Contains(presentationKey))
             {
                 continue;
             }
@@ -279,10 +592,9 @@ public class SimilarItemsManager : ISimilarItemsManager
                 if (item.TryGetProviderId(providerName, out var itemProviderId) && providerLookup.TryGetValue((providerName, itemProviderId), out var matchInfo))
                 {
                     var score = CalculateScore(matchInfo.Score, providerOrder, matchInfo.Position);
-                    if (!resolvedById.TryGetValue(item.Id, out var existing) || existing.Score < score)
+                    if (!resolvedByKey.TryGetValue(presentationKey, out var existing) || existing.Score < score)
                     {
-                        excludeIds.Add(item.Id);
-                        resolvedById[item.Id] = (item, score);
+                        resolvedByKey[presentationKey] = (item, score);
                     }
 
                     break;
@@ -290,7 +602,13 @@ public class SimilarItemsManager : ISimilarItemsManager
             }
         }
 
-        return [.. resolvedById.Values];
+        foreach (var (key, entry) in resolvedByKey)
+        {
+            excludeIds.Add(entry.Item.Id);
+            excludeKeys.Add(key);
+        }
+
+        return [.. resolvedByKey.Values];
     }
 
     private static float CalculateScore(float? matchScore, int providerOrder, int position)
@@ -333,7 +651,13 @@ public class SimilarItemsManager : ISimilarItemsManager
 
         try
         {
-            var stream = File.OpenRead(cachePath);
+            var stream = new FileStream(
+                cachePath,
+                FileMode.Open,
+                FileAccess.Read,
+                FileShare.ReadWrite | FileShare.Delete,
+                IODefaults.FileStreamBufferSize,
+                FileOptions.Asynchronous | FileOptions.SequentialScan);
             await using (stream.ConfigureAwait(false))
             {
                 var cache = await JsonSerializer.DeserializeAsync<SimilarItemsCache>(stream, JsonDefaults.Options, cancellationToken).ConfigureAwait(false);
@@ -357,6 +681,7 @@ public class SimilarItemsManager : ISimilarItemsManager
 
     private async Task SaveSimilarItemsCacheAsync(string cachePath, List<SimilarItemReference> references, TimeSpan cacheDuration, CancellationToken cancellationToken)
     {
+        string? tempPath = null;
         try
         {
             var directory = Path.GetDirectoryName(cachePath);
@@ -371,15 +696,33 @@ public class SimilarItemsManager : ISimilarItemsManager
                 ExpiresAt = DateTime.UtcNow.Add(cacheDuration)
             };
 
-            var stream = File.Create(cachePath);
+            tempPath = cachePath + "." + Guid.NewGuid().ToString("N", CultureInfo.InvariantCulture) + ".tmp";
+            var stream = File.Create(tempPath);
             await using (stream.ConfigureAwait(false))
             {
                 await JsonSerializer.SerializeAsync(stream, cache, JsonDefaults.Options, cancellationToken).ConfigureAwait(false);
             }
+
+            File.Move(tempPath, cachePath, true);
+            tempPath = null;
         }
         catch (IOException ex)
         {
             _logger.LogWarning(ex, "Failed to save similar items cache to {CachePath}", cachePath);
+        }
+        finally
+        {
+            if (tempPath is not null)
+            {
+                try
+                {
+                    File.Delete(tempPath);
+                }
+                catch (IOException ex)
+                {
+                    _logger.LogDebug(ex, "Failed to delete temporary similar items cache file {TempPath}", tempPath);
+                }
+            }
         }
     }
 

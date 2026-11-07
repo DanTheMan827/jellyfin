@@ -9,6 +9,7 @@
     <TargetFramework>net10.0</TargetFramework>
     <GenerateAssemblyInfo>false</GenerateAssemblyInfo>
     <GenerateDocumentationFile>true</GenerateDocumentationFile>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
   </PropertyGroup>
 
   <ItemGroup>
@@ -24,6 +25,7 @@
   <ItemGroup>
     <PackageReference Include="AsyncKeyedLock" />
     <PackageReference Include="BDInfo" />
+    <PackageReference Include="DiscUtils.Udf" />
     <PackageReference Include="libse" />
     <PackageReference Include="Microsoft.Extensions.Http" />
     <PackageReference Include="UTF.Unknown" />

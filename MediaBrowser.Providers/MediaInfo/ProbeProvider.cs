@@ -24,6 +24,8 @@ using MediaBrowser.Model.Globalization;
 using MediaBrowser.Model.IO;
 using MediaBrowser.Model.MediaInfo;
 using Microsoft.Extensions.Logging;
+using PDFtoImage;
+using SharpCompress.Archives;
 
 namespace MediaBrowser.Providers.MediaInfo
 {
@@ -37,6 +39,7 @@ namespace MediaBrowser.Providers.MediaInfo
         ICustomMetadataProvider<Video>,
         ICustomMetadataProvider<Audio>,
         ICustomMetadataProvider<AudioBook>,
+        ICustomMetadataProvider<Book>,
         IHasOrder,
         IForcedProvider,
         IPreRefreshProvider,
@@ -124,7 +127,7 @@ namespace MediaBrowser.Providers.MediaInfo
         public bool HasChanged(BaseItem item, IDirectoryService directoryService)
         {
             var video = item as Video;
-            if (video is null || video.VideoType == VideoType.VideoFile || video.VideoType == VideoType.Iso)
+            if (video is null || video.VideoType == VideoType.VideoFile || video.VideoType == VideoType.Iso || video.IsDiscReference)
             {
                 var path = item.Path;
 
@@ -137,6 +140,12 @@ namespace MediaBrowser.Providers.MediaInfo
                         return true;
                     }
                 }
+            }
+
+            if (IsMissingMediaInfo(item))
+            {
+                _logger.LogDebug("Refreshing {ItemPath} because it has no media information.", item.Path);
+                return true;
             }
 
             if (video is not null
@@ -170,6 +179,25 @@ namespace MediaBrowser.Providers.MediaInfo
             }
 
             return false;
+        }
+
+        private static bool IsMissingMediaInfo(BaseItem item)
+        {
+            if (item.RunTimeTicks.HasValue
+                || item.TotalBitrate.HasValue
+                || item.IsVirtualItem
+                || item.IsShortcut
+                || !item.IsFileProtocol)
+            {
+                return false;
+            }
+
+            return item switch
+            {
+                Video video => !video.IsPlaceHolder && video.IsCompleteMedia,
+                Audio => true,
+                _ => false
+            };
         }
 
         /// <inheritdoc />
@@ -214,6 +242,57 @@ namespace MediaBrowser.Providers.MediaInfo
             return FetchAudioInfo(item, options, cancellationToken);
         }
 
+        /// <inheritdoc />
+        public Task<ItemUpdateType> FetchAsync(Book item, MetadataRefreshOptions options, CancellationToken cancellationToken)
+        {
+            if (item.IsVirtualItem || !item.IsFileProtocol)
+            {
+                return _cachedTask;
+            }
+
+            long pageCount;
+            switch (Path.GetExtension(item.Path).ToLowerInvariant())
+            {
+                case ".cb7":
+                case ".cbr":
+                case ".cbt":
+                case ".cbz":
+                    using (var stream = File.OpenRead(item.Path))
+                    using (var archive = ArchiveFactory.OpenArchive(stream))
+                    {
+                        pageCount = archive.Entries.Count(e => !e.IsDirectory);
+                    }
+
+                    break;
+
+#pragma warning disable CA1416
+                case ".pdf":
+                    using (var stream = File.OpenRead(item.Path))
+                    {
+                        pageCount = Conversion.GetPageCount(stream);
+                    }
+
+                    break;
+#pragma warning restore CA1416
+
+                case ".epub":
+                    // TODO process CFI and store as a string when multiple progress types are supported
+                    // current progress value is percentage stored as a proportion of one second worth of ticks
+                    item.RunTimeTicks = TimeSpan.TicksPerSecond;
+
+                    return Task.FromResult(ItemUpdateType.MetadataImport);
+
+                default:
+                    return _cachedTask;
+            }
+
+            // TODO use page count without modification when multiple progress types are supported
+            // book players report page count and the web client multiplies that value by 10000 to convert the expected milliseconds into ticks
+            item.RunTimeTicks = pageCount * 10000;
+
+            return Task.FromResult(ItemUpdateType.MetadataImport);
+        }
+
         /// <summary>
         /// Fetches video information for an item.
         /// </summary>
@@ -225,9 +304,19 @@ namespace MediaBrowser.Providers.MediaInfo
         public Task<ItemUpdateType> FetchVideoInfo<T>(T item, MetadataRefreshOptions options, CancellationToken cancellationToken)
             where T : Video
         {
+            // Pick up edits to a .strm disc reference (dvd:// or bluray://); an invalid one turns the item into a
+            // placeholder, and one that no longer uses those schemes becomes an ordinary .strm item again.
+            var discReferenceChanged = false;
+            if (DiscReference.IsStrmPath(item.Path))
+            {
+                discReferenceChanged = DiscReference.TryRead(item.Path, DiscReference.GetLibraryRoots(BaseItem.LibraryManager), _logger, out var discReference)
+                    ? item.ApplyDiscReference(discReference)
+                    : item.ClearDiscReference();
+            }
+
             if (item.IsPlaceHolder)
             {
-                return _cachedTask;
+                return discReferenceChanged ? Task.FromResult(ItemUpdateType.MetadataImport) : _cachedTask;
             }
 
             if (!item.IsCompleteMedia)

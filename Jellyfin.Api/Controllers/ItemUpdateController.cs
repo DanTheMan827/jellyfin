@@ -15,11 +15,13 @@ using MediaBrowser.Controller.Entities.Audio;
 using MediaBrowser.Controller.Entities.TV;
 using MediaBrowser.Controller.Library;
 using MediaBrowser.Controller.LiveTv;
+using MediaBrowser.Controller.MediaEncoding;
 using MediaBrowser.Controller.Providers;
 using MediaBrowser.Model.Dto;
 using MediaBrowser.Model.Entities;
 using MediaBrowser.Model.Globalization;
 using MediaBrowser.Model.IO;
+using MediaBrowser.Model.MediaInfo;
 using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.Http;
 using Microsoft.AspNetCore.Mvc;
@@ -38,6 +40,7 @@ public class ItemUpdateController : BaseJellyfinApiController
     private readonly ILocalizationManager _localizationManager;
     private readonly IFileSystem _fileSystem;
     private readonly IServerConfigurationManager _serverConfigurationManager;
+    private readonly IMediaEncoder _mediaEncoder;
 
     /// <summary>
     /// Initializes a new instance of the <see cref="ItemUpdateController"/> class.
@@ -47,18 +50,21 @@ public class ItemUpdateController : BaseJellyfinApiController
     /// <param name="providerManager">Instance of the <see cref="IProviderManager"/> interface.</param>
     /// <param name="localizationManager">Instance of the <see cref="ILocalizationManager"/> interface.</param>
     /// <param name="serverConfigurationManager">Instance of the <see cref="IServerConfigurationManager"/> interface.</param>
+    /// <param name="mediaEncoder">Instance of the <see cref="IMediaEncoder"/> interface.</param>
     public ItemUpdateController(
         IFileSystem fileSystem,
         ILibraryManager libraryManager,
         IProviderManager providerManager,
         ILocalizationManager localizationManager,
-        IServerConfigurationManager serverConfigurationManager)
+        IServerConfigurationManager serverConfigurationManager,
+        IMediaEncoder mediaEncoder)
     {
         _libraryManager = libraryManager;
         _providerManager = providerManager;
         _localizationManager = localizationManager;
         _fileSystem = fileSystem;
         _serverConfigurationManager = serverConfigurationManager;
+        _mediaEncoder = mediaEncoder;
     }
 
     /// <summary>
@@ -88,6 +94,10 @@ public class ItemUpdateController : BaseJellyfinApiController
             series.DisplayOrder ?? string.Empty,
             request.DisplayOrder ?? string.Empty,
             StringComparison.OrdinalIgnoreCase);
+        // Queue a re-probe only when a supported disc item's stored title differs from the requested title.
+        var shouldReprobeForTitleChange = item is Video existingVideo
+            && IsIsoPlaybackTitleSupported(existingVideo)
+            && existingVideo.IsoPlaybackTitle != request.IsoPlaybackTitle;
 
         // Do this first so that metadata savers can pull the updates from the database.
         if (request.People is not null)
@@ -132,6 +142,19 @@ public class ItemUpdateController : BaseJellyfinApiController
                 RefreshPriority.High);
         }
 
+        if (shouldReprobeForTitleChange)
+        {
+            // Re-probe using the selected title so tracks/codecs/chapters reflect that title.
+            _providerManager.QueueRefresh(
+                item.Id,
+                new MetadataRefreshOptions(new DirectoryService(_fileSystem))
+                {
+                    MetadataRefreshMode = MetadataRefreshMode.FullRefresh,
+                    ImageRefreshMode = MetadataRefreshMode.None
+                },
+                RefreshPriority.High);
+        }
+
         return NoContent();
     }
 
@@ -161,7 +184,9 @@ public class ItemUpdateController : BaseJellyfinApiController
             Cultures = _localizationManager.GetCultures()
                 .DistinctBy(c => c.DisplayName, StringComparer.OrdinalIgnoreCase)
                 .OrderBy(c => c.DisplayName)
-                .ToArray()
+                .ToArray(),
+            SupportsDvdVideo = _mediaEncoder.SupportsDvdVideo,
+            SupportsLibBluray = _mediaEncoder.SupportsLibBluray
         };
 
         if (!item.IsVirtualItem
@@ -194,6 +219,71 @@ public class ItemUpdateController : BaseJellyfinApiController
         }
 
         return info;
+    }
+
+    /// <summary>
+    /// Gets the available playback titles for a DVD or Blu-ray (ISO or unpacked directory).
+    /// Returns a list of title numbers and their durations so the user can select the desired title.
+    /// </summary>
+    /// <param name="itemId">The item id.</param>
+    /// <response code="200">Titles returned.</response>
+    /// <response code="404">Item not found.</response>
+    /// <response code="400">Item is not a DVD/Blu-ray ISO or unpacked disc.</response>
+    /// <returns>A list of <see cref="IsoTitleInfo"/> on success.</returns>
+    [HttpGet("Items/{itemId}/IsoTitles")]
+    [ProducesResponseType(StatusCodes.Status200OK)]
+    [ProducesResponseType(StatusCodes.Status400BadRequest)]
+    [ProducesResponseType(StatusCodes.Status404NotFound)]
+    public ActionResult<IReadOnlyList<IsoTitleInfo>> GetIsoTitles([FromRoute, Required] Guid itemId)
+    {
+        var item = _libraryManager.GetItemById<BaseItem>(itemId, User.GetUserId());
+        if (item is null)
+        {
+            return NotFound();
+        }
+
+        // A .strm disc reference's title is fixed by its file, so it doesn't offer title selection.
+        if (item is not Video video || video.IsDiscReference)
+        {
+            return BadRequest(_localizationManager.GetLocalizedString("ItemNotDvdBluray"));
+        }
+
+        IsoType? effectiveIsoType = video.VideoType switch
+        {
+            VideoType.Iso when video.IsoType.HasValue => video.IsoType.Value,
+            VideoType.BluRay => IsoType.BluRay,
+            VideoType.Dvd => IsoType.Dvd,
+            _ => null
+        };
+
+        if (effectiveIsoType is null)
+        {
+            if (video.VideoType == VideoType.Iso)
+            {
+                if (_mediaEncoder.SupportsDvdVideo)
+                {
+                    var dvdTitles = _mediaEncoder.GetIsoTitles(video.MediaPath, IsoType.Dvd);
+                    if (dvdTitles.Count > 0)
+                    {
+                        return Ok(dvdTitles);
+                    }
+                }
+
+                if (_mediaEncoder.SupportsLibBluray)
+                {
+                    var blurayTitles = _mediaEncoder.GetIsoTitles(video.MediaPath, IsoType.BluRay);
+                    if (blurayTitles.Count > 0)
+                    {
+                        return Ok(blurayTitles);
+                    }
+                }
+            }
+
+            return BadRequest(_localizationManager.GetLocalizedString("ItemNotDvdBluray"));
+        }
+
+        var titles = _mediaEncoder.GetIsoTitles(video.MediaPath, effectiveIsoType.Value);
+        return Ok(titles);
     }
 
     /// <summary>
@@ -236,7 +326,7 @@ public class ItemUpdateController : BaseJellyfinApiController
         return NoContent();
     }
 
-    private async Task UpdateItem(BaseItemDto request, BaseItem item)
+    internal async Task UpdateItem(BaseItemDto request, BaseItem item)
     {
         item.Name = request.Name;
         item.ForcedSortName = request.ForcedSortName;
@@ -250,7 +340,11 @@ public class ItemUpdateController : BaseJellyfinApiController
         item.IndexNumber = request.IndexNumber;
         item.ParentIndexNumber = request.ParentIndexNumber;
         item.Overview = request.Overview;
-        item.Genres = request.Genres.Distinct(StringComparer.OrdinalIgnoreCase).ToArray();
+
+        if (request.Genres is not null)
+        {
+            item.Genres = request.Genres.Distinct(StringComparer.OrdinalIgnoreCase).ToArray();
+        }
 
         if (item is Episode episode)
         {
@@ -279,30 +373,51 @@ public class ItemUpdateController : BaseJellyfinApiController
             item.DateCreated = NormalizeDateTime(request.DateCreated.Value);
         }
 
+        if (request.SeriesName is not null && item is IHasSeries hasSeries)
+        {
+            hasSeries.SeriesName = request.SeriesName;
+        }
+
         item.EndDate = request.EndDate.HasValue ? NormalizeDateTime(request.EndDate.Value) : null;
         item.PremiereDate = request.PremiereDate.HasValue ? NormalizeDateTime(request.PremiereDate.Value) : null;
         item.ProductionYear = request.ProductionYear;
 
+        var previousOfficialRating = item.OfficialRating;
+        var previousCustomRating = item.CustomRating;
         request.OfficialRating = string.IsNullOrWhiteSpace(request.OfficialRating) ? null : request.OfficialRating;
         item.OfficialRating = request.OfficialRating;
         item.CustomRating = request.CustomRating;
 
         var currentTags = item.Tags;
-        var newTags = request.Tags.Distinct(StringComparer.OrdinalIgnoreCase).ToArray();
-        var removedTags = currentTags.Except(newTags).ToList();
-        var addedTags = newTags.Except(currentTags).ToList();
-        item.Tags = newTags;
+        List<string> removedTags;
+        List<string> addedTags;
+        if (request.Tags is not null)
+        {
+            var newTags = request.Tags.Select(t => t.Trim()).Distinct(StringComparer.OrdinalIgnoreCase).ToArray();
+            removedTags = currentTags.Except(newTags).ToList();
+            addedTags = newTags.Except(currentTags).ToList();
+            item.Tags = newTags;
+        }
+        else
+        {
+            removedTags = [];
+            addedTags = [];
+        }
 
         if (item is Series rseries)
         {
             foreach (var season in rseries.Children.OfType<Season>())
             {
+                season.SeriesName = rseries.Name;
+
+                var previousSeasonOfficialRating = season.OfficialRating;
+                var previousSeasonCustomRating = season.CustomRating;
                 if (!season.LockedFields.Contains(MetadataField.OfficialRating))
                 {
-                    season.OfficialRating = request.OfficialRating;
+                    season.OfficialRating = GetPropagatedRating(season.OfficialRating, previousOfficialRating, request.OfficialRating);
                 }
 
-                season.CustomRating = request.CustomRating;
+                season.CustomRating = GetPropagatedRating(season.CustomRating, previousCustomRating, request.CustomRating);
 
                 if (!season.LockedFields.Contains(MetadataField.Tags))
                 {
@@ -314,12 +429,14 @@ public class ItemUpdateController : BaseJellyfinApiController
 
                 foreach (var ep in season.Children.OfType<Episode>())
                 {
+                    ep.SeriesName = rseries.Name;
+
                     if (!ep.LockedFields.Contains(MetadataField.OfficialRating))
                     {
-                        ep.OfficialRating = request.OfficialRating;
+                        ep.OfficialRating = GetPropagatedRating(ep.OfficialRating, previousSeasonOfficialRating, season.OfficialRating);
                     }
 
-                    ep.CustomRating = request.CustomRating;
+                    ep.CustomRating = GetPropagatedRating(ep.CustomRating, previousSeasonCustomRating, season.CustomRating);
 
                     if (!ep.LockedFields.Contains(MetadataField.Tags))
                     {
@@ -335,12 +452,14 @@ public class ItemUpdateController : BaseJellyfinApiController
         {
             foreach (var ep in season.Children.OfType<Episode>())
             {
+                ep.SeasonName = season.Name;
+
                 if (!ep.LockedFields.Contains(MetadataField.OfficialRating))
                 {
-                    ep.OfficialRating = request.OfficialRating;
+                    ep.OfficialRating = GetPropagatedRating(ep.OfficialRating, previousOfficialRating, request.OfficialRating);
                 }
 
-                ep.CustomRating = request.CustomRating;
+                ep.CustomRating = GetPropagatedRating(ep.CustomRating, previousCustomRating, request.CustomRating);
 
                 if (!ep.LockedFields.Contains(MetadataField.Tags))
                 {
@@ -357,10 +476,10 @@ public class ItemUpdateController : BaseJellyfinApiController
             {
                 if (!track.LockedFields.Contains(MetadataField.OfficialRating))
                 {
-                    track.OfficialRating = request.OfficialRating;
+                    track.OfficialRating = GetPropagatedRating(track.OfficialRating, previousOfficialRating, request.OfficialRating);
                 }
 
-                track.CustomRating = request.CustomRating;
+                track.CustomRating = GetPropagatedRating(track.CustomRating, previousCustomRating, request.CustomRating);
 
                 if (!track.LockedFields.Contains(MetadataField.Tags))
                 {
@@ -403,19 +522,20 @@ public class ItemUpdateController : BaseJellyfinApiController
             item.RunTimeTicks = request.RunTimeTicks;
         }
 
-        foreach (var pair in request.ProviderIds.ToList())
+        if (request.ProviderIds is not null)
         {
-            if (string.IsNullOrEmpty(pair.Value))
-            {
-                request.ProviderIds.Remove(pair.Key);
-            }
+            item.SetProviderIds(request.ProviderIds);
         }
-
-        item.ProviderIds = request.ProviderIds;
 
         if (item is Video video)
         {
             video.Video3DFormat = request.Video3DFormat;
+
+            // Allow setting the ISO/disc playback title for DVD/Blu-ray ISO files or unpacked directories.
+            if (IsIsoPlaybackTitleSupported(video))
+            {
+                video.IsoPlaybackTitle = request.IsoPlaybackTitle;
+            }
         }
 
         if (request.AlbumArtists is not null)
@@ -456,6 +576,33 @@ public class ItemUpdateController : BaseJellyfinApiController
                 }
         }
     }
+
+    /// <summary>
+    /// Gets the rating a child should carry after its parent's rating changed from <paramref name="previousRating"/>
+    /// to <paramref name="newRating"/>: a child with no rating, or the parent's previous one, follows the parent.
+    /// A child with a rating of its own, or any child when the parent's rating did not change, keeps its rating.
+    /// </summary>
+    private static string? GetPropagatedRating(string? childRating, string? previousRating, string? newRating)
+    {
+        if (string.Equals(previousRating ?? string.Empty, newRating ?? string.Empty, StringComparison.OrdinalIgnoreCase))
+        {
+            return childRating;
+        }
+
+        return string.IsNullOrEmpty(childRating) || string.Equals(childRating, previousRating, StringComparison.OrdinalIgnoreCase)
+            ? newRating
+            : childRating;
+    }
+
+    /// <summary>
+    /// Determines whether ISO/disc playback title selection applies to the given video item.
+    /// Supported for unpacked DVD/Blu-ray directories and ISO items with a known <see cref="IsoType"/>,
+    /// except for <c>.strm</c> disc references, whose file decides the title.
+    /// </summary>
+    private static bool IsIsoPlaybackTitleSupported(Video video)
+        => !video.IsDiscReference
+            && (video.VideoType is MediaBrowser.Model.Entities.VideoType.Dvd or MediaBrowser.Model.Entities.VideoType.BluRay
+                || (video.VideoType == MediaBrowser.Model.Entities.VideoType.Iso && video.IsoType.HasValue));
 
     private SeriesStatus? GetSeriesStatus(BaseItemDto item)
     {

@@ -6,7 +6,9 @@ using System.Diagnostics;
 using System.Globalization;
 using System.Linq;
 using System.Runtime.Versioning;
+using System.Text;
 using System.Text.RegularExpressions;
+using System.Threading.Tasks;
 using MediaBrowser.Controller.MediaEncoding;
 using Microsoft.Extensions.Logging;
 
@@ -184,15 +186,12 @@ namespace MediaBrowser.MediaEncoding.Encoder
             { "libavdevice", new Version(58, 13) },
             { "libavfilter", new Version(7, 110) },
             { "libswscale", new Version(5, 9) },
-            { "libswresample", new Version(3, 9) },
-            { "libpostproc", new Version(55, 9) }
+            { "libswresample", new Version(3, 9) }
         };
 
         private readonly ILogger _logger;
 
         private readonly string _encoderPath;
-
-        private readonly Version _minFFmpegMultiThreadedCli = new Version(7, 0);
 
         public EncoderValidator(ILogger logger, string encoderPath)
         {
@@ -551,9 +550,9 @@ namespace MediaBrowser.MediaEncoding.Encoder
             string output;
             try
             {
-                // With multi-threaded cli support, FFmpeg 7 is less sensitive to keyboard input
-                var duration = ffmpegVersion >= _minFFmpegMultiThreadedCli ? 10000 : 1000;
-                output = GetProcessOutput(_encoderPath, $"-hide_banner -f lavfi -i nullsrc=s=1x1:d={duration} -f null -", true, "?");
+                // Start a dummy encode of 1x1@1fps. Send '?' to stdin to get the help/keybind text, followed by 'q' to stop the job immediately
+                // As a safeguard in case 'q' doesn't stop the job, the dummy input has a max duration of 5 (realtime) seconds
+                output = GetProcessOutput(_encoderPath, $"-hide_banner -re -f lavfi -i nullsrc=s=1x1:r=1:d=5 -f null -", true, "?q");
             }
             catch (Exception ex)
             {
@@ -572,6 +571,52 @@ namespace MediaBrowser.MediaEncoding.Encoder
         public bool CheckSupportedProberOption(string option, string proberPath)
         {
             return !string.IsNullOrEmpty(option) && GetProcessExitCode(proberPath, $"-loglevel quiet -f lavfi -i nullsrc=s=1x1:d=1 -{option}");
+        }
+
+        /// <summary>
+        /// Checks whether the <c>dvdvideo</c> demuxer is compiled into ffmpeg.
+        /// The demuxer requires libdvdnav and libdvdread at build time.
+        /// </summary>
+        /// <returns><c>true</c> if dvdvideo is listed in <c>ffmpeg -formats</c>.</returns>
+        public bool CheckDvdVideoSupport()
+        {
+            string output;
+            try
+            {
+                output = GetProcessOutput(_encoderPath, "-formats", false, null);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Error checking dvdvideo demuxer support");
+                return false;
+            }
+
+            return output.Contains("dvdvideo", StringComparison.OrdinalIgnoreCase);
+        }
+
+        /// <summary>
+        /// Checks whether the <c>bluray</c> input protocol is compiled into ffmpeg.
+        /// The protocol requires libbluray at build time.
+        /// </summary>
+        /// <returns><c>true</c> if bluray is listed in <c>ffmpeg -protocols</c>.</returns>
+        public bool CheckLibBluraySupport()
+        {
+            string output;
+            try
+            {
+                output = GetProcessOutput(_encoderPath, "-protocols", false, null);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Error checking libbluray protocol support");
+                return false;
+            }
+
+            // The output lists one protocol per line; match the token exactly to avoid false positives.
+            // Split on both \r\n and \n to handle different line-ending conventions.
+            return output
+                .Split(['\r', '\n'], StringSplitOptions.RemoveEmptyEntries)
+                .Any(line => string.Equals(line.Trim(), "bluray", StringComparison.OrdinalIgnoreCase));
         }
 
         private IEnumerable<string> GetCodecs(Codec codec)
@@ -645,7 +690,9 @@ namespace MediaBrowser.MediaEncoding.Encoder
                     WindowStyle = ProcessWindowStyle.Hidden,
                     ErrorDialog = false,
                     RedirectStandardInput = redirectStandardIn,
+                    StandardOutputEncoding = Encoding.UTF8,
                     RedirectStandardOutput = true,
+                    StandardErrorEncoding = Encoding.UTF8,
                     RedirectStandardError = true
                 }
             })
@@ -660,8 +707,15 @@ namespace MediaBrowser.MediaEncoding.Encoder
                     writer.Write(testKey);
                 }
 
-                using var reader = readStdErr ? process.StandardError : process.StandardOutput;
-                return reader.ReadToEnd();
+                // Drain both streams concurrently to prevent pipe hanging, see #17429
+                using var standardOutput = process.StandardOutput;
+                using var standardError = process.StandardError;
+                var standardOutputTask = standardOutput.ReadToEndAsync();
+                var standardErrorTask = standardError.ReadToEndAsync();
+                process.WaitForExit();
+                Task.WaitAll(standardOutputTask, standardErrorTask);
+
+                return (readStdErr ? standardErrorTask : standardOutputTask).GetAwaiter().GetResult();
             }
         }
 

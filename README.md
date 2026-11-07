@@ -7,34 +7,16 @@
 <img alt="Logo Banner" src="https://raw.githubusercontent.com/jellyfin/jellyfin-ux/master/branding/SVG/banner-logo-solid.svg?sanitize=true"/>
 <br/>
 <br/>
-<a href="https://github.com/jellyfin/jellyfin">
-<img alt="GPL 2.0 License" src="https://img.shields.io/github/license/jellyfin/jellyfin.svg"/>
-</a>
-<a href="https://github.com/jellyfin/jellyfin/releases">
-<img alt="Current Release" src="https://img.shields.io/github/release/jellyfin/jellyfin.svg"/>
-</a>
-<a href="https://translate.jellyfin.org/projects/jellyfin/jellyfin-core/?utm_source=widget">
-<img alt="Translation Status" src="https://translate.jellyfin.org/widgets/jellyfin/-/jellyfin-core/svg-badge.svg"/>
-</a>
-<a href="https://hub.docker.com/r/jellyfin/jellyfin">
-<img alt="Docker Pull Count" src="https://img.shields.io/docker/pulls/jellyfin/jellyfin.svg"/>
-</a>
+<a href="https://github.com/jellyfin/jellyfin"><img alt="GPL 2.0 License" src="https://img.shields.io/github/license/jellyfin/jellyfin.svg"/></a>
+<a href="https://github.com/jellyfin/jellyfin/releases"><img alt="Current Release" src="https://img.shields.io/github/release/jellyfin/jellyfin.svg"/></a>
+<a href="https://translate.jellyfin.org/projects/jellyfin/jellyfin-core/?utm_source=widget"><img alt="Translation Status" src="https://translate.jellyfin.org/widgets/jellyfin/-/jellyfin-core/svg-badge.svg"/></a>
+<a href="https://hub.docker.com/r/jellyfin/jellyfin"><img alt="Docker Pull Count" src="https://img.shields.io/docker/pulls/jellyfin/jellyfin.svg"/></a>
 <br/>
-<a href="https://opencollective.com/jellyfin">
-<img alt="Donate" src="https://img.shields.io/opencollective/all/jellyfin.svg?label=backers"/>
-</a>
-<a href="https://features.jellyfin.org">
-<img alt="Submit Feature Requests" src="https://img.shields.io/badge/fider-vote%20on%20features-success.svg"/>
-</a>
-<a href="https://matrix.to/#/#jellyfinorg:matrix.org">
-<img alt="Chat on Matrix" src="https://img.shields.io/matrix/jellyfinorg:matrix.org.svg?logo=matrix"/>
-</a>
-<a href="https://github.com/jellyfin/jellyfin/releases.atom">
-<img alt="Release RSS Feed" src="https://img.shields.io/badge/rss-releases-ffa500?logo=rss" />
-</a>
-<a href="https://github.com/jellyfin/jellyfin/commits/master.atom">
-<img alt="Master Commits RSS Feed" src="https://img.shields.io/badge/rss-commits-ffa500?logo=rss" />
-</a>
+<a href="https://opencollective.com/jellyfin"><img alt="Donate" src="https://img.shields.io/opencollective/all/jellyfin.svg?label=backers"/></a>
+<a href="https://features.jellyfin.org"><img alt="Submit Feature Requests" src="https://img.shields.io/badge/fider-vote%20on%20features-success.svg"/></a>
+<a href="https://matrix.to/#/#jellyfinorg:matrix.org"><img alt="Chat on Matrix" src="https://img.shields.io/matrix/jellyfinorg:matrix.org.svg?logo=matrix"/></a>
+<a href="https://github.com/jellyfin/jellyfin/releases.atom"><img alt="Release RSS Feed" src="https://img.shields.io/badge/rss-releases-ffa500?logo=rss" /></a>
+<a href="https://github.com/jellyfin/jellyfin/commits/master.atom"><img alt="Master Commits RSS Feed" src="https://img.shields.io/badge/rss-commits-ffa500?logo=rss" /></a>
 </p>
 
 ---
@@ -107,7 +89,7 @@ The following instructions will help you get the project up and running via the 
 
 #### Running With Visual Studio
 
-To run the project with Visual Studio you can open the Solution (`.sln`) file and then press `F5` to run the server.
+To run the project with Visual Studio you can open the solution (`.slnx`) file and then press `F5` to run the server.
 
 #### Running With Visual Studio Code
 
@@ -184,7 +166,7 @@ The following sections describe some more advanced scenarios for running the ser
 It is not necessary to host the frontend web client as part of the backend server. Hosting these two components separately may be useful for frontend developers who would prefer to host the client in a separate webpack development server for a tighter development loop. See the [jellyfin-web](https://github.com/jellyfin/jellyfin-web#getting-started) repo for instructions on how to do this.
 
 To instruct the server not to host the web content, there is a `nowebclient` configuration flag that must be set. This can be specified using the command line
-switch `--nowebclient` or the environment variable `JELLYFIN_NOWEBCONTENT=true`.
+switch `--nowebclient` or the environment variable `JELLYFIN_HOSTWEBCLIENT=false`.
 
 Since this is a common scenario, there is also a separate launch profile defined for Visual Studio called `Jellyfin.Server (nowebcontent)` that can be selected from the 'Start Debugging' dropdown in the main toolbar.
 

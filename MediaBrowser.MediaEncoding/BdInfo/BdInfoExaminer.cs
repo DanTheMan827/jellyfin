@@ -87,10 +87,44 @@ public class BdInfoExaminer : IBlurayExaminer
         if (playlist.StreamClips is not null && playlist.StreamClips.Count > 0)
         {
             // Get the files in the playlist
-            outputStream.Files = playlist.StreamClips.Select(i => i.StreamFile.FileInfo.FullName).ToArray();
+            outputStream.Files = playlist.StreamClips.Where(i => i.AngleIndex == 0).Select(i => i.StreamFile.FileInfo.FullName).ToArray();
         }
 
         return outputStream;
+    }
+
+    /// <inheritdoc />
+    public IReadOnlyList<IsoTitleInfo> GetTitles(string path)
+    {
+        if (string.IsNullOrWhiteSpace(path))
+        {
+            throw new ArgumentNullException(nameof(path));
+        }
+
+        var bdrom = new BDROM(BdInfoDirectoryInfo.FromFileSystemPath(_fileSystem, path));
+        bdrom.Scan();
+
+        // Enumerate all valid playlists sorted by filename (alphabetical playlist order).
+        // Title numbers are the integer value of the .mpls file name without the extension.
+        var titles = new List<IsoTitleInfo>();
+        foreach (var playlist in bdrom.PlaylistFiles.Values.OrderBy(p => p.Name))
+        {
+            if (playlist.IsValid)
+            {
+                var playlistIdString = playlist.Name.Split(".").FirstOrDefault();
+
+                if (playlistIdString != null && playlistIdString.Length > 0 && int.TryParse(playlistIdString, out var playlistId))
+                {
+                    titles.Add(new IsoTitleInfo
+                    {
+                        TitleNumber = playlistId,
+                        DurationTicks = TimeSpan.FromSeconds(playlist.TotalLength).Ticks
+                    });
+                }
+            }
+        }
+
+        return titles;
     }
 
     /// <summary>

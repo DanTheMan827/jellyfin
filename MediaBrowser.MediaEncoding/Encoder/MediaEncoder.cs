@@ -7,6 +7,7 @@ using System.Diagnostics;
 using System.Globalization;
 using System.IO;
 using System.Linq;
+using System.Text;
 using System.Text.Json;
 using System.Text.RegularExpressions;
 using System.Threading;
@@ -85,7 +86,12 @@ namespace MediaBrowser.MediaEncoding.Encoder
         private bool _isVaapiDeviceSupportVulkanDrmModifier = false;
         private bool _isVaapiDeviceSupportVulkanDrmInterop = false;
 
+        private bool _canSetProcessPriority = true;
+
         private bool _isVideoToolboxAv1DecodeAvailable = false;
+
+        private bool _supportsDvdVideo = false;
+        private bool _supportsLibBluray = false;
 
         private static string[] _vulkanImageDrmFmtModifierExts =
         {
@@ -164,6 +170,12 @@ namespace MediaBrowser.MediaEncoding.Encoder
         public bool IsVaapiDeviceSupportVulkanDrmInterop => _isVaapiDeviceSupportVulkanDrmInterop;
 
         public bool IsVideoToolboxAv1DecodeAvailable => _isVideoToolboxAv1DecodeAvailable;
+
+        /// <inheritdoc />
+        public bool SupportsDvdVideo => _supportsDvdVideo;
+
+        /// <inheritdoc />
+        public bool SupportsLibBluray => _supportsLibBluray;
 
         [GeneratedRegex(@"[^\/\\]+?(\.[^\/\\\n.]+)?$")]
         private static partial Regex FfprobePathRegex();
@@ -275,6 +287,11 @@ namespace MediaBrowser.MediaEncoding.Encoder
                 {
                     _isVideoToolboxAv1DecodeAvailable = validator.CheckIsVideoToolboxAv1DecodeAvailable();
                 }
+
+                // Check DVD and Blu-ray disc feature availability.
+                _supportsDvdVideo = validator.CheckDvdVideoSupport();
+                _supportsLibBluray = validator.CheckLibBluraySupport();
+                _logger.LogInformation("FFmpeg disc features — dvdvideo: {DvdVideo}, libbluray: {LibBluray}", _supportsDvdVideo, _supportsLibBluray);
             }
 
             _logger.LogInformation("FFmpeg: {FfmpegPath}", _ffmpegPath ?? string.Empty);
@@ -416,15 +433,39 @@ namespace MediaBrowser.MediaEncoding.Encoder
         {
             var extractChapters = request.ExtractChapters;
             var extraArgs = GetExtraArguments(request);
+            var inputPath = GetInputArgument(request.MediaSource.Path, request.MediaSource);
+            var mediaSource = request.MediaSource;
+
+            // Title-based probing applies to disc video sources; audio probe requests do not use disc title selection.
+            if (mediaSource.IsoPlaybackTitle.HasValue && request.MediaType != DlnaProfileType.Audio)
+            {
+                // Probe using the selected title when available so stream/chapter metadata reflects
+                // the user-selected title rather than the default playlist/file sequence.
+                if (((mediaSource.VideoType == VideoType.Dvd)
+                    || (mediaSource.VideoType == VideoType.Iso && mediaSource.IsoType == IsoType.Dvd))
+                    && _supportsDvdVideo)
+                {
+                    extraArgs += $" -f dvdvideo -title {mediaSource.IsoPlaybackTitle.Value}";
+                    inputPath = GetDvdVideoInputArgument(mediaSource.Path, mediaSource.Protocol);
+                }
+                else if (((mediaSource.VideoType == VideoType.BluRay)
+                    || (mediaSource.VideoType == VideoType.Iso && mediaSource.IsoType == IsoType.BluRay))
+                    && _supportsLibBluray)
+                {
+                    // IsoPlaybackTitle is 1-based for display; libbluray expects 0-based.
+                    extraArgs += $" -playlist {mediaSource.IsoPlaybackTitle.Value.ToString(CultureInfo.InvariantCulture).PadLeft(5, '0')}";
+                    inputPath = GetInputPathArgument(mediaSource.Path, mediaSource);
+                }
+            }
 
             return GetMediaInfoInternal(
-                GetInputArgument(request.MediaSource.Path, request.MediaSource),
-                request.MediaSource.Path,
-                request.MediaSource.Protocol,
+                inputPath,
+                mediaSource.Path,
+                mediaSource.Protocol,
                 extractChapters,
                 extraArgs,
                 request.MediaType == DlnaProfileType.Audio,
-                request.MediaSource.VideoType,
+                mediaSource.VideoType,
                 cancellationToken);
         }
 
@@ -526,6 +567,7 @@ namespace MediaBrowser.MediaEncoding.Encoder
                     UseShellExecute = false,
 
                     // Must consume both or ffmpeg may hang due to deadlocks.
+                    StandardOutputEncoding = Encoding.UTF8,
                     RedirectStandardOutput = true,
 
                     FileName = _ffprobePath,
@@ -625,11 +667,14 @@ namespace MediaBrowser.MediaEncoding.Encoder
         {
             var inputArgument = GetInputPathArgument(inputFile, mediaSource);
 
+            // Select the same DVD title / Blu-ray playlist that playback uses, so images match what is played.
+            var inputOptions = isAudio ? string.Empty : GetDiscTitleInputOptions(mediaSource);
+
             if (!isAudio)
             {
                 try
                 {
-                    return await ExtractImageInternal(inputArgument, container, videoStream, imageStreamIndex, threedFormat, offset, true, targetFormat, false, cancellationToken).ConfigureAwait(false);
+                    return await ExtractImageInternal(inputArgument, inputOptions, container, videoStream, imageStreamIndex, threedFormat, offset, true, targetFormat, false, cancellationToken).ConfigureAwait(false);
                 }
                 catch (ArgumentException)
                 {
@@ -641,7 +686,37 @@ namespace MediaBrowser.MediaEncoding.Encoder
                 }
             }
 
-            return await ExtractImageInternal(inputArgument, container, videoStream, imageStreamIndex, threedFormat, offset, false, targetFormat, isAudio, cancellationToken).ConfigureAwait(false);
+            return await ExtractImageInternal(inputArgument, inputOptions, container, videoStream, imageStreamIndex, threedFormat, offset, false, targetFormat, isAudio, cancellationToken).ConfigureAwait(false);
+        }
+
+        /// <summary>
+        /// Gets the ffmpeg input options that select the source's DVD title or Blu-ray playlist,
+        /// matching the options used for playback.
+        /// </summary>
+        /// <param name="mediaSource">The media source.</param>
+        /// <returns>The input options followed by a space, or an empty string when no title applies.</returns>
+        private string GetDiscTitleInputOptions(MediaSourceInfo mediaSource)
+        {
+            if (mediaSource?.IsoPlaybackTitle is not int title)
+            {
+                return string.Empty;
+            }
+
+            var isDvd = mediaSource.VideoType == VideoType.Dvd
+                || (mediaSource.VideoType == VideoType.Iso && mediaSource.IsoType == IsoType.Dvd);
+            if (isDvd && _supportsDvdVideo)
+            {
+                return "-f dvdvideo -title " + title.ToString(CultureInfo.InvariantCulture) + " ";
+            }
+
+            var isBluRay = mediaSource.VideoType == VideoType.BluRay
+                || (mediaSource.VideoType == VideoType.Iso && mediaSource.IsoType == IsoType.BluRay);
+            if (isBluRay && _supportsLibBluray)
+            {
+                return "-playlist " + title.ToString(CultureInfo.InvariantCulture).PadLeft(5, '0') + " ";
+            }
+
+            return string.Empty;
         }
 
         private string GetImageResolutionParameter()
@@ -669,6 +744,7 @@ namespace MediaBrowser.MediaEncoding.Encoder
 
         private async Task<string> ExtractImageInternal(
             string inputPath,
+            string inputOptions,
             string container,
             MediaStream videoStream,
             int? imageStreamIndex,
@@ -707,7 +783,7 @@ namespace MediaBrowser.MediaEncoding.Encoder
                 // fsbs crop width in half,set the display aspect,crop out any black bars we may have made
                 Video3DFormat.FullSideBySide => @"crop=iw/2:ih:0:0,setdar=dar=a,crop=min(iw\,ih*dar):min(ih\,iw/dar):(iw-min(iw\,iw*sar))/2:(ih - min (ih\,ih/sar))/2,setsar=sar=1",
                 // htab crop height in half,scale to correct size, set the display aspect,crop out any black bars we may have made
-                Video3DFormat.HalfTopAndBottom => @"crop=iw:ih/2:0:0,scale=(iw*2):ih),setdar=dar=a,crop=min(iw\,ih*dar):min(ih\,iw/dar):(iw-min(iw\,iw*sar))/2:(ih - min (ih\,ih/sar))/2,setsar=sar=1",
+                Video3DFormat.HalfTopAndBottom => @"crop=iw:ih/2:0:0,scale=(iw*2):ih,setdar=dar=a,crop=min(iw\,ih*dar):min(ih\,iw/dar):(iw-min(iw\,iw*sar))/2:(ih - min (ih\,ih/sar))/2,setsar=sar=1",
                 // ftab crop height in half, set the display aspect,crop out any black bars we may have made
                 Video3DFormat.FullTopAndBottom => @"crop=iw:ih/2:0:0,setdar=dar=a,crop=min(iw\,ih*dar):min(ih\,iw/dar):(iw-min(iw\,iw*sar))/2:(ih - min (ih\,ih/sar))/2,setsar=sar=1",
                 _ => "scale=round(iw*sar/2)*2:round(ih/2)*2"
@@ -745,14 +821,15 @@ namespace MediaBrowser.MediaEncoding.Encoder
             var mapArg = imageStreamIndex.HasValue ? (" -map 0:" + imageStreamIndex.Value.ToString(CultureInfo.InvariantCulture)) : string.Empty;
             var args = string.Format(
                 CultureInfo.InvariantCulture,
-                "-i {0}{1} -threads {2} -v quiet -vframes 1 -vf {3}{4}{5} -f image2 \"{6}\"",
+                "{7}-i {0}{1} -threads {2} -v quiet -vframes 1 -vf {3}{4}{5} -f image2 \"{6}\"",
                 inputPath,
                 mapArg,
                 _threads,
                 vf,
                 isAudio ? string.Empty : GetImageResolutionParameter(),
                 EncodingHelper.GetVideoSyncOption("-1", EncoderVersion), // auto decide fps mode
-                tempExtractPath);
+                tempExtractPath,
+                inputOptions);
 
             if (offset.HasValue)
             {
@@ -767,7 +844,8 @@ namespace MediaBrowser.MediaEncoding.Encoder
                 args = "-skip_frame nokey " + args;
             }
 
-            if (!string.IsNullOrWhiteSpace(container))
+            // Disc title options already choose the demuxer.
+            if (!string.IsNullOrWhiteSpace(container) && string.IsNullOrEmpty(inputOptions))
             {
                 var inputFormat = EncodingHelper.GetInputFormat(container);
                 if (!string.IsNullOrWhiteSpace(inputFormat))
@@ -918,10 +996,38 @@ namespace MediaBrowser.MediaEncoding.Encoder
                 inputArg = "-hwaccel_flags +low_priority " + inputArg;
             }
 
+            // Force the video stream, otherwise ffmpeg may pick a cover image.
+            var streamIndex = EncodingHelper.FindIndex(mediaSource.MediaStreams, imageStream);
+            if (streamIndex < 0)
+            {
+                throw new InvalidOperationException($"Unable to locate requested stream {imageStream.Title}");
+            }
+
+            inputArg += " -map 0:" + streamIndex;
+
             var filterParam = encodingHelper.GetVideoProcessingFilterParam(jobState, options, vidEncoder).Trim();
             if (string.IsNullOrWhiteSpace(filterParam))
             {
                 throw new InvalidOperationException("EncodingHelper returned empty or invalid filter parameters.");
+            }
+
+            // Normalize invalid PTS from containers for non keyframe only mode
+            if (!enableKeyFrameOnlyExtraction)
+            {
+                var fpsFilterIndex = filterParam.IndexOf("fps=", StringComparison.Ordinal);
+                if (fpsFilterIndex >= 0)
+                {
+                    var inputFrameRate = (imageStream.ReferenceFrameRate.HasValue && imageStream.ReferenceFrameRate > 0)
+                        ? imageStream.ReferenceFrameRate.Value : 30;
+
+                    var setPtsFilter = string.Create(CultureInfo.InvariantCulture, $"setpts=N/{inputFrameRate:F3}/TB,");
+
+                    filterParam = filterParam.Insert(fpsFilterIndex, setPtsFilter);
+                }
+                else
+                {
+                    throw new InvalidOperationException("EncodingHelper returned invalid filter parameters.");
+                }
             }
 
             try
@@ -1123,13 +1229,22 @@ namespace MediaBrowser.MediaEncoding.Encoder
         {
             process.Process.Start();
 
-            try
+            if (_canSetProcessPriority)
             {
-                process.Process.PriorityClass = ProcessPriorityClass.BelowNormal;
-            }
-            catch (Exception ex)
-            {
-                _logger.LogWarning(ex, "Unable to set process priority to BelowNormal for {ProcessFileName}", process.Process.StartInfo.FileName);
+                try
+                {
+                    process.Process.PriorityClass = ProcessPriorityClass.BelowNormal;
+                }
+                catch (InvalidOperationException)
+                {
+                    // The process finished before its priority could be lowered. That says nothing
+                    // about whether the platform allows it, so keep the capability for the next one.
+                }
+                catch (Exception ex)
+                {
+                    _canSetProcessPriority = false;
+                    _logger.LogWarning(ex, "Unable to set process priority to BelowNormal for {ProcessFileName}. Further attempts will be skipped.", process.Process.StartInfo.FileName);
+                }
             }
 
             lock (_runningProcessesLock)
@@ -1268,6 +1383,74 @@ namespace MediaBrowser.MediaEncoding.Encoder
             => _blurayExaminer.GetDiscInfo(path).Files;
 
         /// <inheritdoc />
+        public IReadOnlyList<IsoTitleInfo> GetIsoTitles(string path, IsoType isoType)
+        {
+            if (isoType == IsoType.BluRay)
+            {
+                // Title enumeration for Blu-ray uses BDInfo (no ffmpeg dependency), but playback
+                // of a specific title requires libbluray in ffmpeg.  Return an empty list when
+                // libbluray is absent so the UI doesn't offer a selection that cannot be honoured.
+                if (!_supportsLibBluray)
+                {
+                    _logger.LogDebug("Skipping Blu-ray title enumeration: libbluray not available in ffmpeg");
+                    return Array.Empty<IsoTitleInfo>();
+                }
+
+                try
+                {
+                    return _blurayExaminer.GetTitles(path);
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogError(ex, "Error enumerating Blu-ray titles for {Path}", path);
+                    return Array.Empty<IsoTitleInfo>();
+                }
+            }
+
+            // DVD title enumeration uses pure IFO binary parsing — no ffmpeg/dvdvideo demuxer required.
+            // Note: per-title playback still requires the dvdvideo demuxer at transcode time.
+            return GetDvdTitles(path);
+        }
+
+        /// <summary>
+        /// Enumerates DVD titles and their durations by parsing the IFO files directly.
+        /// Works for both ISO files and unpacked DVD directories without requiring ffprobe.
+        /// </summary>
+        private IReadOnlyList<IsoTitleInfo> GetDvdTitles(string path)
+        {
+            bool isFile = File.Exists(path);
+
+            DvdDiscInfo disc;
+            try
+            {
+                disc = isFile
+                    ? DvdVideoProber.ParseVideoTsIso(path, _logger)
+                    : DvdVideoProber.ParseVideoTsDirectory(path, _logger);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Error parsing DVD IFO for {Path}", path);
+                return Array.Empty<IsoTitleInfo>();
+            }
+
+            if (disc.Titles.Count == 0)
+            {
+                return Array.Empty<IsoTitleInfo>();
+            }
+
+            return disc.Titles
+                .OrderBy(t => t.TitleNumber)
+                .Select(t => new IsoTitleInfo
+                {
+                    TitleNumber = t.TitleNumber,
+                    DurationTicks = t.Duration?.Ticks,
+                    ChapterCount = t.ChapterCount,
+                    AngleCount = t.AngleCount
+                })
+                .ToList();
+        }
+
+        /// <inheritdoc />
         public string GetInputPathArgument(EncodingJobInfo state)
             => GetInputPathArgument(state.MediaPath, state.MediaSource);
 
@@ -1276,10 +1459,29 @@ namespace MediaBrowser.MediaEncoding.Encoder
         {
             return mediaSource.VideoType switch
             {
+                // When a specific title has been selected for an unpacked DVD directory, use a raw
+                // filesystem path with dvdvideo. ffmpeg has no "dvd" protocol.
+                // Without a title selection (or when dvdvideo is unavailable), fall back to concat.
+                VideoType.Dvd when mediaSource.IsoPlaybackTitle.HasValue && _supportsDvdVideo
+                    => GetDvdVideoInputArgument(path, mediaSource.Protocol),
                 VideoType.Dvd => GetInputArgument(GetPrimaryPlaylistVobFiles(path, null), mediaSource),
+                // When a specific title has been selected for an unpacked Blu-ray directory, use the
+                // bluray: URI scheme so FFmpeg's libbluray can apply -playlist selection.
+                // Without a title selection (or when libbluray is unavailable), fall back to concat.
+                VideoType.BluRay when mediaSource.IsoPlaybackTitle.HasValue && _supportsLibBluray
+                    => EncodingUtils.GetInputArgument("bluray", path, mediaSource.Protocol),
                 VideoType.BluRay => GetInputArgument(GetPrimaryPlaylistM2tsFiles(path), mediaSource),
+                // dvdvideo demuxer with ISO input requires a raw filesystem path, not file:"path".
+                VideoType.Iso when mediaSource.IsoType == IsoType.Dvd && _supportsDvdVideo
+                    => GetDvdVideoInputArgument(path, mediaSource.Protocol),
                 _ => GetInputArgument(path, mediaSource)
             };
+        }
+
+        private static string GetDvdVideoInputArgument(string inputPath, MediaProtocol protocol)
+        {
+            var normalizedPath = protocol == MediaProtocol.File ? inputPath.EscapeProcessArgument() : inputPath;
+            return string.Format(CultureInfo.InvariantCulture, "\"{0}\"", normalizedPath);
         }
 
         /// <inheritdoc />
@@ -1334,11 +1536,19 @@ namespace MediaBrowser.MediaEncoding.Encoder
             return _configurationManager.GetEncodingOptions().EnableSubtitleExtraction;
         }
 
-        private sealed class ProcessWrapper : IDisposable
+        internal sealed class ProcessWrapper : IDisposable
         {
             private readonly MediaEncoder _mediaEncoder;
 
+            // The exit event is raised on the thread pool, so it writes the state below while the
+            // caller that started the process is reading it.
+            private readonly Lock _exitLock = new();
+
             private bool _disposed = false;
+
+            private bool _hasExited;
+
+            private int? _exitCode;
 
             public ProcessWrapper(Process process, MediaEncoder mediaEncoder)
             {
@@ -1349,49 +1559,84 @@ namespace MediaBrowser.MediaEncoding.Encoder
 
             public Process Process { get; }
 
-            public bool HasExited { get; private set; }
+            // The exit event can lag behind the wait that returned, so ask the process rather than
+            // report one that has exited as still running.
+            public bool HasExited => ReadExitState().HasExited;
 
-            public int? ExitCode { get; private set; }
+            // As above: rather than report no exit code for a process that has one.
+            public int? ExitCode => ReadExitState().ExitCode;
+
+            private (bool HasExited, int? ExitCode) ReadExitState()
+            {
+                lock (_exitLock)
+                {
+                    if (!_hasExited && !_disposed)
+                    {
+                        try
+                        {
+                            if (Process.HasExited)
+                            {
+                                _hasExited = true;
+                                _exitCode = Process.ExitCode;
+                            }
+                        }
+                        catch (InvalidOperationException)
+                        {
+                            // No process is associated with this object, or it was disposed from
+                            // under us - ObjectDisposedException derives from this one.
+                        }
+                    }
+
+                    return (_hasExited, _exitCode);
+                }
+            }
 
             private void OnProcessExited(object sender, EventArgs e)
             {
                 var process = (Process)sender;
 
-                HasExited = true;
-
-                try
+                lock (_exitLock)
                 {
-                    ExitCode = process.ExitCode;
-                }
-                catch
-                {
+                    _hasExited = true;
+
+                    try
+                    {
+                        _exitCode = process.ExitCode;
+                    }
+                    catch
+                    {
+                    }
                 }
 
-                DisposeProcess(process);
+                // Only stop tracking it. The caller that started the process still holds it to read
+                // its output and its exit code, so disposing it here handed whoever was quickest to
+                // exit - an ffprobe on a file it rejects outright - an ObjectDisposedException.
+                Untrack();
             }
 
-            private void DisposeProcess(Process process)
+            private void Untrack()
             {
                 lock (_mediaEncoder._runningProcessesLock)
                 {
                     _mediaEncoder._runningProcesses.Remove(this);
                 }
-
-                process.Dispose();
             }
 
             public void Dispose()
             {
-                if (!_disposed)
+                lock (_exitLock)
                 {
-                    if (Process is not null)
+                    if (_disposed)
                     {
-                        Process.Exited -= OnProcessExited;
-                        DisposeProcess(Process);
+                        return;
                     }
+
+                    _disposed = true;
                 }
 
-                _disposed = true;
+                Process.Exited -= OnProcessExited;
+                Untrack();
+                Process.Dispose();
             }
         }
     }

@@ -64,6 +64,8 @@ namespace MediaBrowser.Controller.MediaEncoding
 
         public VideoType VideoType { get; set; }
 
+        public bool? MapAll { get; set; }
+
         public Dictionary<string, string> RemoteHttpHeaders { get; set; }
 
         public string OutputVideoCodec { get; set; }
@@ -514,6 +516,15 @@ namespace MediaBrowser.Controller.MediaEncoding
         public bool EnableAudioVbrEncoding => BaseRequest.EnableAudioVbrEncoding;
 
         public int HlsListSize => 0;
+
+        /// <summary>
+        /// Adds the specified reason(s) to <see cref="TranscodeReasons"/>.
+        /// </summary>
+        /// <param name="reason">The transcode reason(s) to add.</param>
+        public void AddTranscodeReason(TranscodeReason reason)
+        {
+            _transcodeReasons = TranscodeReasons | reason;
+        }
 
         private int? GetMediaStreamCount(MediaStreamType type, int limit)
         {
